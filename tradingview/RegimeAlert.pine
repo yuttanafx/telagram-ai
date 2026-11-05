@@ -1,0 +1,37 @@
+//@version=5
+// Signal Hub - Market Regime
+// Sends the market regime (trend_up / trend_down / range) to the Signal Hub webhook whenever it changes.
+// TradingView: add this indicator to the chart -> Create Alert -> Condition: this indicator, "Any alert() function call"
+//   -> Notifications: Webhook URL = https://YOUR-APP.vercel.app/api/webhook?key=WEBHOOK_SECRET   (leave the message as is)
+indicator("Signal Hub - Market Regime", overlay=true)
+
+adxLen   = input.int(14, "ADX length", minval=1)
+trendAdx = input.float(25.0, "Trend when ADX >=")
+rangeAdx = input.float(20.0, "Range when ADX <")
+fastLen  = input.int(20, "Fast EMA", minval=1)
+slowLen  = input.int(50, "Slow EMA", minval=2)
+account  = input.string("", "MT5 account number (empty = every account)")
+ttlMin   = input.int(1440, "Regime stays valid for (minutes)", minval=1, maxval=1440)
+
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+
+// ADX between the two thresholds keeps the previous regime (no flip-flopping)
+var string regime = "range"
+if adx >= trendAdx and emaFast > emaSlow
+    regime := "trend_up"
+else if adx >= trendAdx and emaFast < emaSlow
+    regime := "trend_down"
+else if adx < rangeAdx
+    regime := "range"
+
+bgcolor(regime == "trend_up" ? color.new(color.green, 90) : regime == "trend_down" ? color.new(color.red, 90) : color.new(color.blue, 92))
+plot(emaFast, "Fast EMA", color.new(color.aqua, 20))
+plot(emaSlow, "Slow EMA", color.new(color.orange, 20))
+
+var string sent = ""
+if barstate.isconfirmed and regime != sent
+    sent := regime
+    msg = '{"type":"regime","symbol":"' + syminfo.ticker + '","regime":"' + regime + '","ttlMin":' + str.tostring(ttlMin) + (account != "" ? ',"account":"' + account + '"' : "") + '}'
+    alert(msg, alert.freq_once_per_bar_close)
