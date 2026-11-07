@@ -1,0 +1,2196 @@
+//+------------------------------------------------------------------+
+//|                                  Terravolteco_SmartGold_V22_Final |
+//|                               Copyright 2026, Yutthana Thongma |
+//|                         + Signal Hub AI profile module (V22_AI)  |
+//|                         + Orb position picker + in-chart AI chat |
+//|                         + S/R + RR zones (display only)          |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade\Trade.mqh>
+#include <ChartObjects\ChartObjectsTxtControls.mqh>
+#include <Canvas\Canvas.mqh>
+
+//--- UI theme (dark neon)
+#define HDR_H        88
+#define UI_BG        C'13,17,28'
+#define UI_BORDER    C'38,50,78'
+#define UI_FIELD     C'22,29,46'
+#define UI_FIELD_TXT C'226,236,255'
+#define UI_TXT_DIM   C'150,166,196'
+#define UI_HDR_TOP   C'26,38,76'
+#define UI_HDR_BOT   C'10,14,26'
+#define UI_GREEN     C'0,214,143'
+#define UI_GREEN_ON  C'0,150,105'
+#define UI_GREEN_DIM C'24,64,56'
+#define UI_RED       C'255,84,112'
+#define UI_RED_ON    C'206,48,82'
+#define UI_RED_DIM   C'88,32,50'
+#define UI_BLUE      C'52,100,230'
+#define UI_GRAY      C'70,82,106'
+#define UI_AMBER     C'255,176,32'
+#define UI_VIOLET    C'124,76,236'
+
+
+//--- [HIDDEN CONFIGURATION]
+string EXPIRY_DATE = "2026.12.21"; 
+
+//--- [USER INPUTS: ตั้งค่าได้จากหน้าต่าง Inputs]
+input double InpMaxLot          = 1.00;    // Max Lot ต่อไม้ (เพดานลอทสูงสุด)
+input double InpEquitySL_Pct    = 50.00;   // Equity Stop (%) ปิดทั้งหมดเมื่อ Equity ต่ำกว่า Balance กี่ %
+input double InpRecMultiplier   = 2.0;     // Recovery Multiplier (ตัวคูณลอทไม้แก้)
+
+//--- ตัวแปรทำงานของ Recovery Multiplier (AI Profile เขียนทับได้ เพราะ input แก้ค่าในโค้ดไม่ได้)
+double g_RecMult = InpRecMultiplier;
+
+//--- [INTERNAL VARIABLES]
+int    InpMaxSpread    = 4000;       
+bool   InpUseEMACrossExit = true;  
+int    InpEMACrossPips    = 15000;   
+int    InpMaxRecAttempts  = 6;     
+bool   InpUseTrailUSD     = true;  
+double InpTrailStartUSD   = 150.0;   
+double InpTrailLockUSD    = 100.0;   
+
+bool   InpUseWallet       = true;    
+double InpHarvestPct      = 20.0;    
+double InpMinWalletToUse  = 5.0;     
+
+double InpTP_Normal       = 5.0;     
+double InpTP_OldTrend     = 20.0;     
+double InpLot             = 0.01;     
+double InpLotMult         = 1.5;     
+int    InpStep            = 600;     
+double InpStepMult        = 1.7;     
+double InpStepMultAg      = 3.0;     
+int    InpMax             = 10;       
+string InpT1_Start        = "03:00"; 
+string InpT1_End          = "14:00";  
+string InpT2_Start        = "16:00"; 
+string InpT2_End          = "22:00";  
+
+//--- ค่าเริ่มต้น EMA ทั้ง 3 เส้น
+int    InpEMAVFast        = 5;   // ตัวใหม่ EMA 5
+int    InpEMAFast          = 50;  
+int    InpEMASlow          = 200;   
+
+input int   InpMagicNum     = 889900;
+input bool InpOnlyNewBar   = false;  
+
+input bool InpWaitCross        = true;   // รอ EMA5 ตัดมาฝั่งเดียวกับเทรนด์ EMA200 ก่อนเปิดไม้ทับถม (true/false)
+input bool InpWaitCrossFirst   = false;  // ใช้เงื่อนไขข้างบนกับ "ไม้แรก" ด้วย (true/false)
+input int  InpShiftTrend       = 0;      // Shift ของ EMA50 / EMA200 (0 = แท่งปัจจุบัน, 1 = แท่งที่ปิดแล้ว)
+input bool InpManualLossToRec  = true;   // ปิดมือ (CLOSE BUY/SELL/ALL) ถ้าขาดทุน ให้เก็บยอดเข้า Rec Stat เพื่อแก้พอร์ต (true/false)
+input int  InpWalletMinAgeSec  = 60;     // Wallet จะปิดไม้สวนเทรนด์ได้ก็ต่อเมื่อไม้นั้นเปิดมานานอย่างน้อยกี่วินาที (0 = ปิดทันทีได้เหมือนเดิม)
+input bool InpManualClearWallet = true;  // ปิดมือจนไม่เหลือไม้ (CLOSE ALL หรือปิดฝั่งสุดท้าย) ให้ล้าง Recovery Wallet เป็น 0 (true/false)
+input int  InpShiftCross       = 0;      // Shift ของ EMA5 / EMA50 (0 = แท่งปัจจุบัน, 1 = แท่งที่ปิดแล้ว)
+
+//--- GLOBAL VARIABLES
+CTrade trade;
+bool AutoB = true, AutoS = true, UseEMA = true;
+int handleVFast = INVALID_HANDLE, handleFast = INVALID_HANDLE, handleSlow = INVALID_HANDLE;
+datetime lastBarTimeB = 0, lastBarTimeS = 0;
+string GV_WALLET_NAME = "TVE_Wallet_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+
+double LossToRecoverB = 0, LossToRecoverS = 0;
+int    RecCountB = 0, RecCountS = 0;
+double MaxProfitB = 0, MaxProfitS = 0;
+
+// GUI Objects
+CChartObjectButton btnAB, btnAS, btnEMA, btnB, btnS, btnCB, btnCS, btnCA, btnRW;
+CChartObjectEdit   ebLotB, ebStepB, ebLMultB, ebSMB, ebSMAB, ebMaxB, ebTPB_D, ebTPO_B, ebRecB;
+CChartObjectEdit   ebLotS, ebStepS, ebLMultS, ebSMS, ebSMAS, ebMaxS, ebTPS_D, ebTPO_S, ebRecS;
+CChartObjectEdit   ebT1S, ebT1E, ebT2S, ebT2E, ebEMAVF, ebEMAF, ebEMAS, ebWalletDisp, ebExitPips;
+
+void UI_Frame();   // implemented in the UI module below
+void Orb_Say(string text, color tint, int ms);   // implemented in the orb module below
+void Chat_Create();                              // implemented in the chat module below
+void Chat_Place(int left, int top);              // implemented in the chat module below
+void Chat_Hide(bool hide);                       // implemented in the chat module below
+bool GetEMAData(int &trendMain, int &crossVF_F); // implemented in the helpers below
+double GetSafeVal(CChartObjectEdit &obj, double btVal); // implemented in the helpers below
+void SR_CreateButton();                          // implemented in the S/R + RR module below
+void SR_PlaceButton(int x, int y);               // implemented in the S/R + RR module below
+void SR_Event(const int id, const string &sparam); // implemented in the S/R + RR module below
+void SR_Tick();                                  // implemented in the S/R + RR module below
+void SR_Deinit();                                // implemented in the S/R + RR module below
+//==================== Signal Hub AI module (embedded) ====================
+//+------------------------------------------------------------------+
+//| SignalHubAI.mqh                                                  |
+//| Lets the Signal Hub AI pick the market regime, then applies the |
+//| grid profile you set in the dashboard to Terravolteco SmartGold. |
+//| Include it AFTER the dashboard globals (ebLotB, AutoB, ...).     |
+//+------------------------------------------------------------------+
+input string          AI_Url          = "https://your-app.vercel.app"; // Signal Hub URL (add it in Tools > Options > Expert Advisors > Allow WebRequest)
+input string          AI_EAKey        = "";                             // your EA key (the admin gives it to you; it only works on your MT5 account number)
+input ENUM_TIMEFRAMES AI_TF           = PERIOD_M15;                     // timeframe whose indicators are sent to the AI
+input int             AI_PushSeconds  = 60;                             // how often to ask the server (server throttles by its own interval)
+input int             AI_Bars         = 150;                            // candles sent to the hub for its chart and rule-based regime (60-300)
+input double          AI_CapStartLot  = 0.10;                           // safety caps: the EA never applies more than these, whatever the server says
+input double          AI_CapLotMult   = 2.0;
+input int             AI_CapMaxOrders = 12;
+input double          AI_CapRecMult   = 2.5;
+input bool            AI_WebOrders    = true;                           // let the BUY / SELL buttons on the Signal Hub web page open an order on THIS chart's symbol
+input double          AI_CapWebLot    = 0.10;                           // safety cap for the lot sent by the web page (used only when AI_WebUseEALot = false)
+input bool            AI_WebUseEALot  = true;                           // first order from the web uses THIS EA's Lot Start (dashboard Buy / Sell side) instead of the lot sent by the web page, so each account sizes its own risk
+input int             AI_CmdPollSec   = 3;                              // how often to check the web page for a manual order
+input bool            AI_KeepMyLot    = true;                           // AI Profile does NOT overwrite Lot Start (each account keeps its own lot)
+input bool            AI_KeepMyGrid   = false;                          // AI Profile does NOT overwrite the grid values (Step, Step Mult W/A, Lot Mult, Max Order, TP Normal / Old, Rec multiplier); it then only switches Auto Buy / Auto Sell
+input bool            AI_BlockWhileOpen = true;                         // while this EA already has open positions on this symbol, ignore new orders from the web (the dashboard BUY NOW / SELL NOW buttons still work)
+
+void AI_PollCmd();   // defined after the licence block (it needs licOk)
+uint aiLastCmdPoll = 0;
+
+bool     aiOn = true;
+int      aiH_adx = INVALID_HANDLE, aiH_rsi = INVALID_HANDLE, aiH_atr = INVALID_HANDLE, aiH_e20 = INVALID_HANDLE, aiH_e50 = INVALID_HANDLE;
+datetime aiLastPush = 0;
+string   aiLastSig = "";
+string   aiStatus = "AI: waiting for first reply";
+string   aiRegime = "", aiProfile = "";
+double   aiConfV = 0;
+uint     aiTalkUntil = 0;
+bool     aiBusy = false;
+CChartObjectButton btnAI;
+
+string AI_Get(string &L[], int n, string key, string def = "")
+{
+   for(int i = 0; i < n; i++)
+   {
+      int p = StringFind(L[i], "=");
+      if(p > 0 && StringSubstr(L[i], 0, p) == key) return StringSubstr(L[i], p + 1);
+   }
+   return def;
+}
+
+bool AI_Val(int h, double &v)
+{
+   double b[1];
+   if(h == INVALID_HANDLE || CopyBuffer(h, 0, 1, 1, b) <= 0) return false; // last CLOSED bar
+   v = b[0];
+   return true;
+}
+
+void AI_ShowStatus()
+{
+   ObjectSetString(0, "TVE3_AILBL", OBJPROP_TEXT, aiStatus);
+   ChartRedraw();
+}
+
+void AI_ButtonLook()
+{
+   btnAI.Description(aiOn ? "AI Profile: ON" : "AI Profile: OFF (manual)");
+   btnAI.BackColor(aiOn ? UI_VIOLET : UI_GRAY);
+}
+
+void AI_Init()
+{
+   aiH_adx = iADX(_Symbol, AI_TF, 14);
+   aiH_rsi = iRSI(_Symbol, AI_TF, 14, PRICE_CLOSE);
+   aiH_atr = iATR(_Symbol, AI_TF, 14);
+   aiH_e20 = iMA(_Symbol, AI_TF, 20, 0, MODE_EMA, PRICE_CLOSE);
+   aiH_e50 = iMA(_Symbol, AI_TF, 50, 0, MODE_EMA, PRICE_CLOSE);
+
+   btnAI.Create(0, "TVE3_AIBTN", 0, 20, 552, 195, 25);
+   ObjectSetInteger(0, "TVE3_AIBTN", OBJPROP_BORDER_COLOR, UI_BORDER);
+   ObjectSetString(0, "TVE3_AIBTN", OBJPROP_FONT, "Segoe UI");
+   btnAI.Color(clrWhite); btnAI.FontSize(9); btnAI.Selectable(false);
+   AI_ButtonLook();
+   ObjectCreate(0, "TVE3_AILBL", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "TVE3_AILBL", OBJPROP_XDISTANCE, 225);
+   ObjectSetInteger(0, "TVE3_AILBL", OBJPROP_YDISTANCE, 558);
+   ObjectSetString(0, "TVE3_AILBL", OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, "TVE3_AILBL", OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, "TVE3_AILBL", OBJPROP_COLOR, UI_TXT_DIM);
+   ObjectSetString(0, "TVE3_AILBL", OBJPROP_TEXT, aiStatus);
+}
+
+void AI_Deinit()
+{
+   if(aiH_adx != INVALID_HANDLE) IndicatorRelease(aiH_adx);
+   if(aiH_rsi != INVALID_HANDLE) IndicatorRelease(aiH_rsi);
+   if(aiH_atr != INVALID_HANDLE) IndicatorRelease(aiH_atr);
+   if(aiH_e20 != INVALID_HANDLE) IndicatorRelease(aiH_e20);
+   if(aiH_e50 != INVALID_HANDLE) IndicatorRelease(aiH_e50);
+}
+
+void AI_Toggle()
+{
+   aiOn = !aiOn;
+   AI_ButtonLook();
+   aiStatus = aiOn ? "AI: turned on, asking server..." : "AI: off - you control the settings";
+   aiLastPush = 0; aiLastSig = "";
+   AI_ShowStatus();
+}
+
+bool AI_Request(const string body, string &resp)
+{
+   char post[], res[];
+   string rh;
+   int len = StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+   if(len < 0) len = 0;
+   ArrayResize(post, len);
+   string headers = "Content-Type: application/json\r\nx-api-key: " + AI_EAKey + "\r\nx-account: " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\r\n";
+   ResetLastError();
+   int code = WebRequest("POST", AI_Url + "/api/ea/grid", headers, 8000, post, res, rh);
+   if(code != 200)
+   {
+      aiStatus = "AI: request failed (HTTP " + IntegerToString(code) + ", err " + IntegerToString(GetLastError()) + ") - keeping current settings";
+      return false;
+   }
+   resp = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
+   return true;
+}
+
+// Writes the profile into the dashboard boxes the EA already reads, plus the Auto Buy / Auto Sell switches.
+void AI_Apply(string &L[], int n)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lot  = MathMax(minLot, MathMin(StringToDouble(AI_Get(L, n, "lot")), AI_CapStartLot));
+   double lm   = MathMax(1.0, MathMin(StringToDouble(AI_Get(L, n, "lotMult")), AI_CapLotMult));
+   int    stp  = (int)MathMax(50, StringToDouble(AI_Get(L, n, "step")));
+   double sw   = MathMax(1.0, StringToDouble(AI_Get(L, n, "stepW")));
+   double sa   = MathMax(1.0, StringToDouble(AI_Get(L, n, "stepA")));
+   int    mx   = (int)MathMax(1, MathMin(StringToDouble(AI_Get(L, n, "max")), AI_CapMaxOrders));
+   double tpn  = MathMax(0.5, StringToDouble(AI_Get(L, n, "tpN")));
+   double tpo  = MathMax(0.5, StringToDouble(AI_Get(L, n, "tpO")));
+   double rec  = MathMax(1.0, MathMin(StringToDouble(AI_Get(L, n, "recMult")), AI_CapRecMult));
+   bool   buy  = (AI_Get(L, n, "buy") == "1");
+   bool   sell = (AI_Get(L, n, "sell") == "1");
+
+   string sLot = DoubleToString(lot, 2), sLm = DoubleToString(lm, 1), sStep = IntegerToString(stp);
+   string sSw = DoubleToString(sw, 1), sSa = DoubleToString(sa, 1), sMax = IntegerToString(mx);
+   string sTpn = DoubleToString(tpn, 1), sTpo = DoubleToString(tpo, 1);
+
+   if(!AI_KeepMyLot) { ebLotB.Description(sLot); ebLotS.Description(sLot); }
+   if(!AI_KeepMyGrid)
+   {
+      ebLMultB.Description(sLm);  ebLMultS.Description(sLm);
+      ebStepB.Description(sStep); ebStepS.Description(sStep);
+      ebSMB.Description(sSw);     ebSMS.Description(sSw);
+      ebSMAB.Description(sSa);    ebSMAS.Description(sSa);
+      ebMaxB.Description(sMax);   ebMaxS.Description(sMax);
+      ebTPB_D.Description(sTpn);  ebTPS_D.Description(sTpn);
+      ebTPO_B.Description(sTpo);  ebTPO_S.Description(sTpo);
+      g_RecMult = rec;
+   }
+
+   AutoB = buy;  btnAB.Description(AutoB ? "AutoBuy: ON"  : "AutoBuy: OFF");  btnAB.BackColor(AutoB ? UI_GREEN_ON : UI_GREEN_DIM);
+   AutoS = sell; btnAS.Description(AutoS ? "AutoSell: ON" : "AutoSell: OFF"); btnAS.BackColor(AutoS ? UI_RED_ON  : UI_RED_DIM);
+}
+
+void AI_OnTick()
+{
+   AI_PollCmd();                                            // manual BUY/SELL from the web page (works even when AI Profile is OFF)
+   if(!aiOn || MQLInfoInteger(MQL_TESTER)) return;          // WebRequest does not work in the Strategy Tester
+   if(TimeLocal() - aiLastPush < AI_PushSeconds) return;   // TimeLocal: TimeCurrent() stops moving when no ticks arrive (market closed)
+   aiLastPush = TimeLocal();
+
+   double adx, rsi, atr, e20, e50;
+   if(!AI_Val(aiH_adx, adx) || !AI_Val(aiH_rsi, rsi) || !AI_Val(aiH_atr, atr) || !AI_Val(aiH_e20, e20) || !AI_Val(aiH_e50, e50) || atr <= 0)
+   { aiStatus = "AI: indicators not ready yet"; AI_ShowStatus(); return; }
+
+   string body = StringFormat("{\"symbol\":\"%s\",\"tf\":\"%s\",\"price\":%.5f,\"adx\":%.2f,\"rsi\":%.2f,\"atr\":%.5f,\"ema20\":%.5f,\"ema50\":%.5f",
+                              _Symbol, StringSubstr(EnumToString(AI_TF), 7), SymbolInfoDouble(_Symbol, SYMBOL_BID), adx, rsi, atr, e20, e50);
+   // closed candles of AI_TF, oldest first: [time,open,high,low,close]
+   MqlRates rt[];
+   int want = (int)MathMax(60, MathMin(AI_Bars, 300));
+   int got = CopyRates(_Symbol, AI_TF, 1, want, rt);
+   if(got >= 60)
+   {
+      string bars = "";
+      for(int i = 0; i < got; i++)
+         bars += (i > 0 ? "," : "") + StringFormat("[%I64d,%.5f,%.5f,%.5f,%.5f]", (long)rt[i].time, rt[i].open, rt[i].high, rt[i].low, rt[i].close);
+      body += ",\"bars\":[" + bars + "]";
+   }
+   if(got < 60) Print("SignalHubAI: only ", got, " candles of ", EnumToString(AI_TF), " (err ", GetLastError(), ") - bars NOT sent. Open that timeframe once / scroll the chart to load history.");
+   body += "}";
+   string resp;
+   aiBusy = true; UI_Frame();          // robot shows its 'thinking' pose while the request runs
+   bool okReq = AI_Request(body, resp);
+   aiBusy = false;
+   if(!okReq) { AI_ShowStatus(); return; }
+
+   string L[];
+   int n = StringSplit(resp, '\n', L);
+   for(int i = 0; i < n; i++) { StringTrimLeft(L[i]); StringTrimRight(L[i]); }
+   if(AI_Get(L, n, "ok") != "1") { aiStatus = "AI: unexpected reply - keeping current settings"; AI_ShowStatus(); return; }
+
+   string regime = AI_Get(L, n, "regime"), prof = AI_Get(L, n, "profile"), sig = AI_Get(L, n, "sig");
+   aiRegime = regime; aiProfile = prof; aiConfV = StringToDouble(AI_Get(L, n, "conf"));
+   if(AI_Get(L, n, "hold") == "1")
+      aiStatus = "AI: not confident (" + regime + ") - keeping current settings | bars " + IntegerToString(MathMax(got, 0));
+   else
+   {
+      if(sig != aiLastSig)
+      {
+         AI_Apply(L, n);
+         aiLastSig = sig;
+         aiTalkUntil = GetTickCount() + 6000;   // robot talks and waves for a few seconds
+         Print("SignalHubAI: regime=", regime, " -> profile ", prof, " applied");
+      }
+      aiStatus = "AI: " + regime + " -> " + prof + " (" + AI_Get(L, n, "conf") + ") | bars " + IntegerToString(MathMax(got, 0));
+   }
+   AI_ShowStatus();
+}
+
+//==================== end of AI module ====================
+
+//==================== Remote licence: Google Sheet (account whitelist) ====================
+// Sheet layout (first tab):  A = account number | B = expiry yyyy-mm-dd (optional) | C = ON/OFF (optional, blank = ON) | D = name/note
+// Share the sheet as "Anyone with the link: Viewer". Users must allow https://docs.google.com in Tools > Options > Expert Advisors > Allow WebRequest.
+string LIC_SheetUrl     = "https://docs.google.com/spreadsheets/d/1YKipAKASdCaLQjeCTT2PDRxdMOP4MklegNnfaxE4oNA/gviz/tq?tqx=out:csv&gid=0";
+int    LIC_CheckMinutes = 30;   // how often the sheet is re-read while the EA runs
+int    LIC_GraceHours   = 24;   // if the sheet cannot be reached, keep trading on the last good answer for this long
+
+bool     licOk = true;          // false = no NEW orders (open baskets are still managed and closed normally)
+datetime licLastCheck = 0;
+string   licMsg = "LIC: checking...";
+string   licGV = "TVE_LIC_OK_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+
+bool LIC_Fetch(string &csv)
+{
+   char post[], res[];
+   string rh;
+   ResetLastError();
+   int code = WebRequest("GET", LIC_SheetUrl, "", 8000, post, res, rh);
+   if(code != 200)
+   {
+      licMsg = "LIC: sheet unreachable (HTTP " + IntegerToString(code) + ", err " + IntegerToString(GetLastError()) + ")";
+      if(code == -1) licMsg += " - add https://docs.google.com to Allow WebRequest";
+      return false;
+   }
+   csv = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
+   if(StringFind(csv, "<html") >= 0 || StringFind(csv, "<!DOCTYPE") >= 0)
+   {
+      licMsg = "LIC: sheet is not public (share = Anyone with the link: Viewer)";
+      return false;
+   }
+   return true;
+}
+
+int LIC_Cells(string line, string &c[])
+{
+   ArrayResize(c, 0);
+   string cur = "";
+   bool q = false;
+   int n = StringLen(line);
+   for(int i = 0; i < n; i++)
+   {
+      ushort ch = StringGetCharacter(line, i);
+      if(ch == '"') { q = !q; continue; }
+      if(ch == ',' && !q) { int k = ArraySize(c); ArrayResize(c, k + 1); c[k] = cur; cur = ""; continue; }
+      cur += ShortToString(ch);
+   }
+   int k2 = ArraySize(c);
+   ArrayResize(c, k2 + 1);
+   c[k2] = cur;
+   return ArraySize(c);
+}
+
+string LIC_Digits(string s)
+{
+   string o = "";
+   for(int i = 0; i < StringLen(s); i++)
+   {
+      ushort ch = StringGetCharacter(s, i);
+      if(ch >= '0' && ch <= '9') o += ShortToString(ch);
+   }
+   return o;
+}
+
+// Accepts yyyy-mm-dd (recommended), yyyy.mm.dd, yyyy/mm/dd, d/m/yyyy or m/d/yyyy (only when unambiguous),
+// a Sheets serial number (e.g. 46387), and Buddhist-era years (2569 -> 2026).
+bool LIC_ParseDate(string e, datetime &t)
+{
+   StringTrimLeft(e); StringTrimRight(e);
+   int sp = StringFind(e, " ");
+   if(sp > 0) e = StringSubstr(e, 0, sp);                       // drop a time part
+   StringReplace(e, "-", "."); StringReplace(e, "/", ".");
+
+   if(LIC_Digits(e) == e && StringLen(e) >= 5)                  // Sheets serial number: days since 1899-12-30
+   {
+      long sv = StringToInteger(e);
+      if(sv < 30000 || sv > 80000) return false;
+      t = (datetime)((sv - 25569) * 86400);
+      return true;
+   }
+
+   string p[];
+   if(StringSplit(e, '.', p) != 3) return false;
+   int y = 0, m = 0, d = 0;
+   if(StringLen(p[0]) == 4) { y = (int)StringToInteger(p[0]); m = (int)StringToInteger(p[1]); d = (int)StringToInteger(p[2]); }
+   else if(StringLen(p[2]) == 4)
+   {
+      int a = (int)StringToInteger(p[0]), b = (int)StringToInteger(p[1]);
+      y = (int)StringToInteger(p[2]);
+      if(a > 12)       { d = a; m = b; }
+      else if(b > 12)  { m = a; d = b; }
+      else if(a == b)  { d = a; m = b; }
+      else return false;                                        // 03/04/2026 is ambiguous: ask for yyyy-mm-dd
+   }
+   else return false;
+   if(y > 2400) y -= 543;
+   if(y < 2000 || m < 1 || m > 12 || d < 1 || d > 31) return false;
+   t = StringToTime(StringFormat("%04d.%02d.%02d", y, m, d));
+   return (t > 0);
+}
+
+// 1 = allowed, 0 = denied, -1 = account not in sheet (licMsg explains)
+int LIC_Evaluate(string csv)
+{
+   string acct = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string lines[];
+   int n = StringSplit(csv, '\n', lines);
+   for(int i = 0; i < n; i++)
+   {
+      string c[];
+      int k = LIC_Cells(lines[i], c);
+      if(k < 1 || LIC_Digits(c[0]) != acct) continue;
+
+      if(k >= 3)
+      {
+         string st = c[2];
+         StringTrimLeft(st); StringTrimRight(st); StringToUpper(st);
+         if(st == "OFF" || st == "NO" || st == "0" || st == "FALSE" || st == "BLOCK") { licMsg = "LIC: account disabled in sheet"; return 0; }
+      }
+      if(k >= 2)
+      {
+         string e = c[1];
+         StringTrimLeft(e); StringTrimRight(e);
+         if(e != "")
+         {
+            datetime exp;
+            if(!LIC_ParseDate(e, exp)) { licMsg = "LIC: bad expiry format '" + e + "' (use yyyy-mm-dd)"; return 0; }
+            if(TimeCurrent() > exp + 86399) { licMsg = "LIC: expired " + e; return 0; }
+            licMsg = "LIC: OK until " + e;
+            return 1;
+         }
+      }
+      licMsg = "LIC: OK (no expiry)";
+      return 1;
+   }
+   licMsg = "LIC: account " + acct + " is not in the sheet";
+   return -1;
+}
+
+void LIC_ShowStatus()
+{
+   if(ObjectFind(0, "TVE3_LICLBL") < 0) return;
+   ObjectSetString(0, "TVE3_LICLBL", OBJPROP_TEXT, licMsg);
+   ObjectSetInteger(0, "TVE3_LICLBL", OBJPROP_COLOR, licOk ? UI_GREEN : UI_RED);
+   ChartRedraw();
+}
+
+void LIC_Check()
+{
+   licLastCheck = TimeCurrent();
+   string csv;
+   if(!LIC_Fetch(csv))
+   {
+      // network problem: keep working on the last good answer for a limited time
+      if(GlobalVariableCheck(licGV) && (TimeCurrent() - (datetime)GlobalVariableGet(licGV)) <= LIC_GraceHours * 3600)
+      { licOk = true; licMsg += " - using last OK"; }
+      else licOk = false;
+   }
+   else
+   {
+      licOk = (LIC_Evaluate(csv) == 1);
+      if(licOk) GlobalVariableSet(licGV, (double)TimeCurrent());
+      else GlobalVariableDel(licGV);   // an explicit "no" from the sheet cancels the grace period
+   }
+   LIC_ShowStatus();
+}
+
+bool LIC_Init()
+{
+   LIC_Check();
+   if(!licOk) { Print(licMsg); Alert(licMsg); }
+   return licOk;
+}
+
+void LIC_Tick()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return;
+   if(TimeCurrent() - licLastCheck < LIC_CheckMinutes * 60) return;
+   bool was = licOk;
+   LIC_Check();
+   if(was && !licOk) { Print(licMsg); Alert(licMsg); }
+}
+//==================== end of licence module ====================
+
+//==================== Manual order from the Signal Hub web page ====================
+// The web page queues "BUY/SELL lot"; this chart takes only orders for its own symbol, opens ONE position with the EA's magic
+// number (so the grid manages it from there: averaging, TP, recovery) and reports the result back to the page.
+int AI_Call(const string method, const string path, const string body, string &resp, int timeoutMs = 8000)
+{
+   char post[], res[];
+   string rh;
+   if(StringLen(body) > 0) { int len = StringToCharArray(body, post, 0, WHOLE_ARRAY, CP_UTF8) - 1; ArrayResize(post, MathMax(len, 0)); }
+   string headers = "Content-Type: application/json\r\nx-api-key: " + AI_EAKey + "\r\nx-account: " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\r\n";
+   ResetLastError();
+   int code = WebRequest(method, AI_Url + path, headers, timeoutMs, post, res, rh);
+   resp = (code == -1) ? "" : CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
+   return code;
+}
+
+string AI_Sym6(string s)   // same reduction the server uses: first 6 letters/digits, upper case (XAUUSDm -> XAUUSD)
+{
+   StringToUpper(s);
+   string o = "";
+   for(int i = 0; i < StringLen(s) && StringLen(o) < 6; i++)
+   {
+      ushort c = StringGetCharacter(s, i);
+      if((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) o += ShortToString(c);
+   }
+   return o;
+}
+
+// open positions of this EA (our magic number) on this chart's symbol
+int AI_OpenCount()
+{
+   int c = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetString(POSITION_SYMBOL) == _Symbol) c++;
+   }
+   return c;
+}
+
+void AI_PollCmd()
+{
+   if(!AI_WebOrders || MQLInfoInteger(MQL_TESTER)) return;
+   if(GetTickCount() - aiLastCmdPoll < (uint)(MathMax(1, AI_CmdPollSec) * 1000)) return;
+   aiLastCmdPoll = GetTickCount();
+
+   string resp;
+   int code = AI_Call("GET", "/api/ea/poll?symbol=" + AI_Sym6(_Symbol), "", resp);
+   int werr = GetLastError();
+   static int lastPollCode = 200;
+   if(code != lastPollCode)                                  // tell the user when the connection to the web order queue changes
+   {
+      lastPollCode = code;
+      if(code == 200)                  aiStatus = "WEB: connected - waiting for orders";
+      else if(code == -1)              aiStatus = "WEB: cannot reach site (err " + IntegerToString(werr) + ") - check Allow WebRequest + AI_Url";
+      else if(code == 401 || code == 403) aiStatus = "WEB: EA key wrong / not for this MT5 account";
+      else                             aiStatus = "WEB: server error HTTP " + IntegerToString(code);
+      AI_ShowStatus();
+      if(code != 200) Print("SignalHub web orders: ", aiStatus);
+   }
+   if(code != 200 || StringLen(resp) < 5) return;
+
+   string L[];
+   int n = StringSplit(resp, '\n', L);
+   for(int i = 0; i < n; i++)
+   {
+      StringTrimLeft(L[i]); StringTrimRight(L[i]);
+      string p[];
+      if(StringSplit(L[i], '|', p) < 4) continue;
+      string id = p[0], side = p[2];
+      double lot = StringToDouble(p[3]);
+      bool ok = false; ulong ticket = 0; double price = 0; string note = "";
+
+      if(!licOk) note = "licence off";
+      else if(AI_BlockWhileOpen && AI_OpenCount() > 0) note = "basket open";   // old positions still running: wait until the EA closes them
+      else if(side != "BUY" && side != "SELL") note = "bad side";
+      else
+      {
+         double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), stp = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+         if(AI_WebUseEALot) lot = GetSafeVal(side == "BUY" ? ebLotB : ebLotS, InpLot);   // the EA's own Lot Start, not the web's lot
+         else               lot = MathMin(lot, AI_CapWebLot);
+         if(stp > 0) lot = MathFloor(lot / stp + 1e-9) * stp;
+         lot = NormalizeDouble(MathMax(minL, MathMin(maxL, lot)), 2);
+         ENUM_ORDER_TYPE ot = (side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+         double pr = (side == "BUY") ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         ok = trade.PositionOpen(_Symbol, ot, lot, pr, 0, 0, "Hub:" + id);
+         uint rc = trade.ResultRetcode();
+         ok = ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED);
+         ticket = trade.ResultOrder(); price = trade.ResultPrice();
+         note = ok ? "" : "retcode " + IntegerToString((int)rc);
+      }
+      string r;
+      AI_Call("POST", "/api/ea/report", id + "|" + (ok ? "done" : "failed") + "|" + (string)ticket + "|" + DoubleToString(price, _Digits) + "|" + note, r);
+      aiStatus = ok ? "WEB: " + side + " " + DoubleToString(lot, 2) + " opened" : "WEB: " + side + " failed (" + note + ")";
+      Orb_Say(ok ? "WEB " + side + " " + DoubleToString(lot, 2) : "WEB " + side + " FAILED: " + note, ok ? (side == "BUY" ? C'0,214,143' : C'255,84,112') : C'255,176,32', 6000);
+      Print("SignalHub web order ", id, " ", side, " lot ", DoubleToString(lot, 2), ok ? " opened" : " FAILED " + note);
+      AI_ShowStatus();
+   }
+}
+//==================== end of web order module ====================
+//==================== Animated header + theme (robot) ====================
+CCanvas uiCv;
+bool    uiOk = false;
+uint    uiStart = 0;
+uint    uiStatT = 0;
+double  uiPL = 0;
+int     uiNB = 0, uiNS = 0;
+
+color UI_Mix(color a, color b, double k)
+{
+   if(k < 0) k = 0;
+   if(k > 1) k = 1;
+   int ar = (int)((uint)a & 0xFF), ag = (int)(((uint)a >> 8) & 0xFF), ab = (int)(((uint)a >> 16) & 0xFF);
+   int br = (int)((uint)b & 0xFF), bg = (int)(((uint)b >> 8) & 0xFF), bb = (int)(((uint)b >> 16) & 0xFF);
+   int r = (int)(ar + (br - ar) * k), g = (int)(ag + (bg - ag) * k), bl = (int)(ab + (bb - ab) * k);
+   return (color)(r | (g << 8) | (bl << 16));
+}
+
+uint UI_A(color c) { return ColorToARGB(c, 255); }
+
+void UI_RR(int x1, int y1, int x2, int y2, int r, color c)
+{
+   uint u = UI_A(c);
+   uiCv.FillRectangle(x1 + r, y1, x2 - r, y2, u);
+   uiCv.FillRectangle(x1, y1 + r, x2, y2 - r, u);
+   uiCv.FillCircle(x1 + r, y1 + r, r, u);
+   uiCv.FillCircle(x2 - r, y1 + r, r, u);
+   uiCv.FillCircle(x1 + r, y2 - r, r, u);
+   uiCv.FillCircle(x2 - r, y2 - r, r, u);
+}
+
+// soft glow made of opaque circles blended towards the background colour
+void UI_Glow(int cx, int cy, int r, color c, color bgc, double inten)
+{
+   for(int i = r; i >= 1; i--)
+   {
+      double f = 1.0 - (double)i / r;
+      uiCv.FillCircle(cx, cy, i, UI_A(UI_Mix(bgc, c, inten * f * f)));
+   }
+}
+
+color UI_RegimeColor(string r)
+{
+   if(r == "trend_up")   return UI_GREEN;
+   if(r == "trend_down") return UI_RED;
+   if(r == "range")      return C'64,196,255';
+   if(r == "volatile")   return UI_AMBER;
+   if(r == "news")       return C'190,120,255';
+   return C'140,156,190';
+}
+
+string UI_RegimeText(string r)
+{
+   if(r == "trend_up")   return "TREND UP";
+   if(r == "trend_down") return "TREND DOWN";
+   if(r == "range")      return "RANGE";
+   if(r == "volatile")   return "VOLATILE";
+   if(r == "news")       return "NEWS";
+   return "WAITING AI";
+}
+
+void UI_Stats()
+{
+   if(GetTickCount() - uiStatT < 700) return;
+   uiStatT = GetTickCount();
+   uiPL = 0; uiNB = 0; uiNS = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum) continue;
+      uiPL += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) uiNB++; else uiNS++;
+   }
+}
+
+int UI_Chip(int x, int y, string text, color c, color bgc)
+{
+   uiCv.FontSet("Segoe UI", 11, FW_BOLD);
+   int w = uiCv.TextWidth(text) + 22;
+   UI_RR(x, y, x + w, y + 20, 10, UI_Mix(bgc, c, 0.55));
+   UI_RR(x + 1, y + 1, x + w - 1, y + 19, 9, UI_Mix(bgc, c, 0.16));
+   uiCv.FillCircle(x + 9, y + 10, 2, UI_A(c));
+   uiCv.TextOut(x + 16, y + 3, text, UI_A(c));
+   return x + w + 6;
+}
+
+void UI_StyleEdit(CChartObjectEdit &e, string name)
+{
+   e.BackColor(UI_FIELD);
+   e.Color(UI_FIELD_TXT);
+   e.FontSize(8);
+   e.TextAlign(ALIGN_CENTER);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, UI_BORDER);
+   ObjectSetString(0, name, OBJPROP_FONT, "Segoe UI");
+}
+
+void UI_Frame()
+{
+   if(!uiOk) return;
+   const int W = 440, H = HDR_H;
+   uint now = GetTickCount();
+   double t = (double)(now - uiStart);
+   UI_Stats();
+
+   color acc = licOk ? UI_RegimeColor(aiRegime) : UI_RED;
+   bool talking = (now < aiTalkUntil);
+
+   // ---- background: vertical gradient tinted by the regime colour
+   color top = UI_Mix(UI_HDR_TOP, acc, 0.12), bot = UI_HDR_BOT;
+   for(int y = 0; y < H; y += 2)
+      uiCv.FillRectangle(0, y, W - 1, y + 1, UI_A(UI_Mix(top, bot, (double)y / H)));
+
+   // ---- drifting, twinkling particles
+   for(int i = 0; i < 14; i++)
+   {
+      double px = 104 + MathMod(i * 83.0 + t * (0.012 + 0.004 * (i % 3)), W - 112);
+      double py = 6 + MathMod(i * 37.0, 62) + 4 * MathSin(t / 700.0 + i);
+      double k = 0.15 + 0.30 * (0.5 + 0.5 * MathSin(t / 330.0 + i * 2.1));
+      color bgc = UI_Mix(top, bot, py / H);
+      uiCv.FillCircle((int)px, (int)py, (i % 4 == 0) ? 2 : 1, UI_A(UI_Mix(bgc, acc, k)));
+   }
+
+   // ---- robot
+   double bob = 3.0 * MathSin(t / 420.0);
+   int cx = 52, cy = 46 + (int)bob;
+   color bgc = UI_Mix(top, bot, 0.4);
+   UI_Glow(cx, cy + 10, 44, acc, bgc, 0.30);
+
+   // antenna
+   double pulse = 0.5 + 0.5 * MathSin(t / (licOk ? 260.0 : 90.0));
+   uiCv.Line(cx, cy - 29, cx, cy - 35, UI_A(C'120,140,190'));
+   UI_Glow(cx, cy - 37, 9, acc, bgc, 0.35 + 0.5 * pulse);
+   uiCv.FillCircle(cx, cy - 37, 3, UI_A(UI_Mix(acc, clrWhite, 0.35 * pulse)));
+
+   // arms (right arm waves while the robot is "talking")
+   double aL = -0.15 + 0.05 * MathSin(t / 520.0);
+   double aR = talking ? 2.2 + 0.45 * MathSin(t / 110.0) : 0.15 + 0.05 * MathSin(t / 520.0 + 1.0);
+   int shx = cx - 20, shy = cy + 16;
+   int hx = shx + (int)(15 * MathSin(aL)), hy = shy + (int)(15 * MathCos(aL));
+   uiCv.Line(shx, shy, hx, hy, UI_A(C'96,120,176'));
+   uiCv.Line(shx + 1, shy, hx + 1, hy, UI_A(C'96,120,176'));
+   uiCv.FillCircle(hx, hy, 3, UI_A(acc));
+   shx = cx + 20;
+   hx = shx + (int)(15 * MathSin(aR)); hy = shy + (int)(15 * MathCos(aR));
+   uiCv.Line(shx, shy, hx, hy, UI_A(C'96,120,176'));
+   uiCv.Line(shx + 1, shy, hx + 1, hy, UI_A(C'96,120,176'));
+   uiCv.FillCircle(hx, hy, 3, UI_A(acc));
+
+   // body + chest light
+   UI_RR(cx - 17, cy + 12, cx + 17, cy + 38, 7, C'70,92,140');
+   UI_RR(cx - 16, cy + 13, cx + 16, cy + 37, 6, C'38,50,86');
+   UI_RR(cx - 9, cy + 18, cx + 9, cy + 30, 3, C'10,14,26');
+   uiCv.FillCircle(cx, cy + 24, 3, UI_A(UI_Mix(C'20,28,48', acc, 0.4 + 0.6 * (0.5 + 0.5 * MathSin(t / 260.0)))));
+
+   // head
+   UI_RR(cx - 26, cy - 29, cx + 26, cy + 9, 10, C'86,110,170');
+   UI_RR(cx - 25, cy - 28, cx + 25, cy + 8, 9, C'42,56,94');
+   uiCv.FillRectangle(cx - 30, cy - 14, cx - 27, cy - 2, UI_A(acc));
+   uiCv.FillRectangle(cx + 27, cy - 14, cx + 30, cy - 2, UI_A(acc));
+   UI_RR(cx - 20, cy - 22, cx + 20, cy + 3, 6, C'8,11,20');
+
+   // eyes
+   int ey = cy - 12;
+   bool blink = (MathMod(t, 3300.0) < 140.0);
+   if(!licOk)                                    // alert: X eyes
+   {
+      for(int s = -1; s <= 1; s += 2)
+      {
+         int ex = cx + s * 9;
+         uiCv.Line(ex - 3, ey - 3, ex + 3, ey + 3, UI_A(UI_RED));
+         uiCv.Line(ex - 3, ey + 3, ex + 3, ey - 3, UI_A(UI_RED));
+      }
+   }
+   else if(!aiOn)                                // sleeping
+   {
+      uiCv.FillRectangle(cx - 13, ey, cx - 5, ey + 1, UI_A(C'110,124,160'));
+      uiCv.FillRectangle(cx + 5, ey, cx + 13, ey + 1, UI_A(C'110,124,160'));
+      uiCv.FontSet("Segoe UI", 12, FW_BOLD);
+      for(int j = 0; j < 3; j++)
+      {
+         double age = MathMod(t / 1400.0 + j * 0.33, 1.0);
+         uiCv.TextOut(cx + 24 + (int)(age * 10), cy - 34 - (int)(age * 14), "z", UI_A(UI_Mix(C'150,166,200', top, age)));
+      }
+   }
+   else if(aiBusy)                               // thinking: scanning bar
+   {
+      int bx = cx - 12 + (int)(12 + 12 * MathSin(t / 120.0));
+      UI_Glow(bx, ey, 8, acc, C'8,11,20', 0.8);
+      UI_RR(bx - 4, ey - 2, bx + 4, ey + 2, 2, acc);
+   }
+   else if(blink)
+   {
+      uiCv.FillRectangle(cx - 13, ey, cx - 5, ey + 1, UI_A(acc));
+      uiCv.FillRectangle(cx + 5, ey, cx + 13, ey + 1, UI_A(acc));
+   }
+   else
+   {
+      int ox = (int)(2 * MathSin(t / 1300.0));
+      for(int s = -1; s <= 1; s += 2)
+      {
+         int ex = cx + s * 9 + ox;
+         UI_Glow(ex, ey, 8, acc, C'8,11,20', 0.85);
+         uiCv.FillCircle(ex, ey, 4, UI_A(acc));
+         uiCv.FillCircle(ex - 1, ey - 1, 1, UI_A(clrWhite));
+      }
+   }
+
+   // mouth
+   int my = cy - 1;
+   if(talking && licOk && aiOn)
+   {
+      for(int i = -2; i <= 2; i++)
+      {
+         int h = 1 + (int)(3 * MathAbs(MathSin(t / 90.0 + i * 1.7)));
+         uiCv.FillRectangle(cx + i * 4 - 1, my - h, cx + i * 4 + 1, my + h, UI_A(acc));
+      }
+   }
+   else
+   {
+      color mc = UI_Mix(C'8,11,20', acc, 0.75);
+      uiCv.Line(cx - 5, my - 2, cx - 3, my, UI_A(mc));
+      uiCv.Line(cx - 3, my, cx + 3, my, UI_A(mc));
+      uiCv.Line(cx + 3, my, cx + 5, my - 2, UI_A(mc));
+   }
+
+   // ---- texts
+   uiCv.FontSet("Segoe UI", 15, FW_BOLD);
+   uiCv.TextOut(104, 6, "AI QUANT TRADER PICHAIFX", UI_A(C'236,242,255'));
+   uiCv.FontSet("Segoe UI", 11, FW_NORMAL);
+   uiCv.TextOut(104, 33, "SMARTGOLD  AI GRID  |  " + (aiProfile == "" ? "-" : aiProfile), UI_A(UI_Mix(C'150,166,196', acc, 0.5)));
+
+   // floating P/L
+   color plc = (uiPL > 0.004) ? UI_GREEN : (uiPL < -0.004 ? UI_RED : C'200,212,236');
+   string pls = StringFormat("%+.2f $", uiPL);
+   uiCv.FontSet("Segoe UI", 18, FW_BOLD);
+   uiCv.TextOut(W - 14 - uiCv.TextWidth(pls), 4, pls, UI_A(plc));
+   uiCv.FontSet("Segoe UI", 10, FW_NORMAL);
+   string cnt = "FLOATING   B " + IntegerToString(uiNB) + "  S " + IntegerToString(uiNS);
+   uiCv.TextOut(W - 14 - uiCv.TextWidth(cnt), 32, cnt, UI_A(C'150,166,196'));
+
+   // chips
+   int cxp = 104, cyp = 58;
+   string rt = UI_RegimeText(aiRegime);
+   if(aiRegime != "") rt += " " + IntegerToString((int)MathRound(aiConfV * 100)) + "%";
+   cxp = UI_Chip(cxp, cyp, rt, UI_RegimeColor(aiRegime), bot);
+   cxp = UI_Chip(cxp, cyp, licOk ? "LICENSE OK" : "LICENSE OFF", licOk ? UI_GREEN : UI_RED, bot);
+   cxp = UI_Chip(cxp, cyp, aiOn ? "AI ON" : "AI OFF", aiOn ? C'170,130,255' : UI_GRAY, bot);
+
+   // bottom accent line with a moving shine
+   uiCv.FillRectangle(0, H - 3, W - 1, H - 1, UI_A(UI_Mix(bot, acc, 0.35)));
+   int sx = (int)(t / 5.0) % (W + 160) - 80;
+   int a1 = MathMax(0, sx), a2 = MathMin(W - 1, sx + 120);
+   if(a2 > a1) uiCv.FillRectangle(a1, H - 3, a2, H - 1, UI_A(acc));
+
+   uiCv.Update();
+}
+
+void UI_Init()
+{
+   uiOk = uiCv.CreateBitmapLabel("TVE3_HDR", 10, 10, 440, HDR_H, COLOR_FORMAT_XRGB_NOALPHA);
+   if(uiOk)
+   {
+      ObjectSetInteger(0, "TVE3_HDR", OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, "TVE3_HDR", OBJPROP_BACK, false);
+   }
+   // licence status line (created here so it sits above the panel background)
+   ObjectCreate(0, "TVE3_LICLBL", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "TVE3_LICLBL", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, "TVE3_LICLBL", OBJPROP_YDISTANCE, 586);
+   ObjectSetString(0, "TVE3_LICLBL", OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, "TVE3_LICLBL", OBJPROP_FONTSIZE, 8);
+   LIC_ShowStatus();
+   uiStart = GetTickCount();
+   UI_Frame();
+}
+
+void UI_Deinit()
+{
+   if(uiOk) uiCv.Destroy();
+   uiOk = false;
+}
+//==================== end of UI module ====================
+
+//==================== Translucent AI orb (all settings are EA inputs) ====================
+// A glass sphere floating on the chart. Real transparency: the chart shows through it. It follows the same state as the robot:
+// colour = market regime, "talks" (flicker + ripples) when the AI changes profile / a web order arrives / a chat reply comes, grey when AI is OFF, red when the licence is off.
+#define ORB_DASH_RIGHT 450   // right edge of the dashboard panel (x = 10 + width 440)
+#define CHAT_W         170   // width of the chat block under the orb
+#define CHAT_LINES     8     // reply lines shown
+#define CHAT_LINE_CH   30    // characters per reply line
+#define CHAT_H         (30 + CHAT_LINES * 14 + 6)
+
+enum ENUM_ORB_POS
+{
+   ORB_BESIDE_DASH,    // ข้างแดชบอร์ด
+   ORB_LEFT_TOP,       // ซ้ายบน
+   ORB_RIGHT_TOP,      // ขวาบน
+   ORB_LEFT_BOTTOM,    // ซ้ายล่าง
+   ORB_RIGHT_BOTTOM,   // ขวาล่าง
+   ORB_RIGHT_CENTER    // ขวาตรงกลางกราฟ
+};
+enum ENUM_ORB_COLOR
+{
+   ORBC_AUTO,          // อัตโนมัติ (เปลี่ยนตามสภาพตลาด)
+   ORBC_MINT,          // เขียวมิ้นต์
+   ORBC_VIOLET,        // ม่วง
+   ORBC_BLUE,          // ฟ้า
+   ORBC_GREEN,         // เขียว
+   ORBC_RED,           // แดง
+   ORBC_AMBER,         // ส้ม
+   ORBC_PINK           // ชมพู
+};
+input bool           OrbShow         = true;             // แสดงลูกบอล AI (ปิด = ไม่แสดงทั้งลูกบอลและแชท)
+input ENUM_ORB_POS   OrbPos          = ORB_BESIDE_DASH;  // ตำแหน่งลูกบอล
+input ENUM_ORB_COLOR OrbColor        = ORBC_AUTO;        // สีลูกบอล (อัตโนมัติ = ตามสภาพตลาด)
+input int            OrbSize         = 120;              // ขนาดลูกบอล (พิกเซล 80-200)
+input int            OrbMargin       = 16;               // ระยะห่างจากแดชบอร์ด / ขอบกราฟ
+input bool           ChatEnabled     = true;             // เปิดระบบแชทใต้ลูกบอล (ปิด = ไม่มีแชทและไม่มีปุ่มซ่อนแชท) ซ่อน/แสดงชั่วคราวใช้ปุ่มบนกราฟ
+input int            ChatCooldownSec = 5;                // ถามได้ห่างกันอย่างน้อยกี่วินาที (กันค่า AI บาน)
+input int            ChatMaxChars    = 200;              // คำถามยาวสุดกี่ตัวอักษร
+input int            ChatTimeoutMs   = 30000;            // รอคำตอบจาก AI นานสุดกี่มิลลิวินาที
+input bool           SR_Enabled      = true;             // ปุ่ม "แสดง S/R + RR" ใต้ลูกบอล (แสดงเส้นบนกราฟอย่างเดียว ไม่ส่ง/แก้/ปิดออเดอร์)
+input ENUM_TIMEFRAMES SR_TF          = PERIOD_H1;        // ไทม์เฟรมที่ใช้หา Swing High/Low
+input int            SR_SwingBars    = 5;                // Swing = แท่งที่สูง/ต่ำสุดเมื่อเทียบกับแท่งข้างซ้าย-ขวาข้างละกี่แท่ง (2-20)
+input int            SR_Lookback     = 300;              // มองย้อนหลังกี่แท่ง
+input double         SR_BufferATR    = 0.2;              // เผื่อ SL เลยแนวไปอีก ATR x ค่านี้ (0 = ไม่เผื่อ)
+input double         SR_RR1          = 1.0;              // ช่วง TP1 (RR)
+input double         SR_RR2          = 2.0;              // ช่วง TP2 (RR)
+input double         SR_RR3          = 3.0;              // ช่วง TP3 (RR)
+input bool           SR_FillZones    = true;             // ระบายสีโซน SL / TP1 / TP2 / TP3 ด้านหลังแท่งเทียน
+
+CCanvas orbCv;
+bool    orbOk = false;
+int     orbPos = ORB_BESIDE_DASH;
+bool    chatHidden = false;                      // chat box hidden with the on-chart button (remembered)
+uint    orbStart = 0, orbSayUntil = 0;
+int     orbCW = 0, orbCH = 0;
+string  orbSayText = "";
+color   orbSayTint = C'45,212,191';
+const string ORB_OBJ = "TVE3_ORB";
+const string SR_BTN = "TVE3_SRBTN", SR_GV = "TVE3_SR_ON", SR_PFX = "TVE3_SRL_";   // S/R + RR button, remembered state, prefix of the drawn objects
+bool   srOn = false;
+int    srH_atr = INVALID_HANDLE;
+uint   srLastT = 0;
+const string CHAT_BTN = "TVE3_CHAT_TOGGLE", CHAT_GV = "TVE3_CHAT_HIDDEN";   // the only button on the chart: hide / show the chat box
+
+// fixed orb colours for the OrbColor input (index = OrbColor - 1; ORBC_AUTO follows the market regime)
+color  ORB_PAL[7] = {C'45,212,191', C'167,139,250', C'96,165,250', C'0,214,143', C'255,84,112', C'255,176,32', C'244,114,182'};
+
+int U8(double v) { if(v < 0) return 0; if(v > 255) return 255; return (int)v; }
+uint OrbARGB(int a, int r, int g, int b) { return ((uint)a << 24) | ((uint)r << 16) | ((uint)g << 8) | (uint)b; }
+
+// one-off message on the orb (e.g. a web order); also makes it "talk"
+void Orb_Say(string text, color tint, int ms)
+{
+   orbSayText = text;
+   orbSayTint = tint;
+   orbSayUntil = GetTickCount() + (uint)ms;
+}
+
+void Orb_Place()
+{
+   if(!orbOk) return;
+   int W = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS), H = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+   int rows = (ChatEnabled ? 1 : 0) + (SR_Enabled ? 1 : 0);                      // buttons under the orb
+   int totalH = orbCH + (rows > 0 ? 26 * rows + 4 : 0) + ((ChatEnabled && !chatHidden) ? CHAT_H + 10 : 0);   // orb (+ pill), the buttons and the chat block
+   int pos = orbPos;
+   int x = 0, y = 0;
+   if(pos == ORB_BESIDE_DASH)
+   {
+      x = ORB_DASH_RIGHT + OrbMargin;
+      y = 10;
+      if(x + orbCW > W) pos = ORB_RIGHT_TOP;     // chart too narrow: fall back to the top-right corner
+   }
+   if(pos != ORB_BESIDE_DASH)
+   {
+      x = (pos == ORB_LEFT_TOP || pos == ORB_LEFT_BOTTOM) ? OrbMargin : W - orbCW - OrbMargin;
+      if(pos == ORB_RIGHT_CENTER)                              y = (H - totalH) / 2;     // right edge, vertically centred
+      else if(pos == ORB_LEFT_TOP || pos == ORB_RIGHT_TOP)     y = OrbMargin + 18;
+      else                                                     y = H - totalH - OrbMargin;
+   }
+   if(x < 0) x = 0;
+   if(y < 0) y = 0;
+   ObjectSetInteger(0, ORB_OBJ, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, ORB_OBJ, OBJPROP_YDISTANCE, y);
+   int by = y + orbCH + 4;
+   if(ChatEnabled)
+   {
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_XDISTANCE, x + (orbCW - 110) / 2);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_YDISTANCE, by);
+      by += 26;
+   }
+   if(SR_Enabled)
+   {
+      SR_PlaceButton(x + (orbCW - 110) / 2, by);
+      by += 26;
+   }
+   if(ChatEnabled) Chat_Place(MathMax(0, x + (orbCW - CHAT_W) / 2), by + 2);
+}
+
+// One frame: a glass sphere shaded pixel by pixel (transparent centre, bright rim, drifting coloured light inside,
+// a specular spot, a soft glow, and ripples while it talks). Every pixel has its own alpha.
+void Orb_Frame()
+{
+   if(!orbOk) return;
+   uint now = GetTickCount();
+   double t = (double)(now - orbStart);
+
+   // state -> text / colour / talking
+   string txt;
+   color tint;
+   bool talking;
+   if(!licOk)                  { txt = "LICENSE OFF"; tint = UI_RED; talking = false; }
+   else if(now < orbSayUntil)  { txt = orbSayText; tint = orbSayTint; talking = true; }
+   else if(!aiOn)              { txt = "AI OFF"; tint = C'120,130,150'; talking = false; }
+   else
+   {
+      if(OrbColor != ORBC_AUTO)  tint = ORB_PAL[(int)OrbColor - 1];                 // fixed colour chosen by the user
+      else                  tint = (aiRegime == "") ? C'45,212,191' : UI_RegimeColor(aiRegime);   // automatic: follows the regime
+      txt = aiBusy ? "ANALYZING..." : UI_RegimeText(aiRegime) + (aiRegime != "" ? " " + IntegerToString((int)MathRound(aiConfV * 100)) + "%" : "");
+      talking = aiBusy || (now < aiTalkUntil);
+   }
+
+   double R = (int)MathMax(80, MathMin(OrbSize, 200)) / 2.0;
+   double cx = orbCW / 2.0, cy = orbCW / 2.0 + 2.5 * MathSin(t / 700.0);      // gentle float
+   int tr = (int)((uint)tint & 0xFF), tg = (int)(((uint)tint >> 8) & 0xFF), tb = (int)(((uint)tint >> 16) & 0xFF);
+
+   double breathe = 0.5 + 0.5 * MathSin(t / 1100.0);
+   double flick = talking ? 0.75 + 0.55 * MathAbs(MathSin(t / 47.0) * MathSin(t / 131.0 + 1.3)) + 0.25 * MathAbs(MathSin(t / 23.0)) : 1.0;
+   double energy = (0.8 + 0.25 * breathe) * (talking ? flick * 1.2 : 1.0);
+   double glowK = (0.55 + 0.35 * breathe) * (talking ? 1.0 + 0.5 * MathAbs(MathSin(t / 60.0)) : 1.0);
+
+   // three drifting light blobs, their colours pulled towards the regime colour
+   int bp[3][3] = {{45, 212, 191}, {167, 139, 250}, {96, 165, 250}};
+   double pr[3], pg[3], pb[3], bx[3], by[3];
+   for(int i = 0; i < 3; i++)
+   {
+      pr[i] = bp[i][0] * 0.55 + tr * 0.45;
+      pg[i] = bp[i][1] * 0.55 + tg * 0.45;
+      pb[i] = bp[i][2] * 0.55 + tb * 0.45;
+      double sgn = (i % 2 == 1) ? -1.0 : 1.0;
+      double ang = t / (2600.0 + 700.0 * i) + i * 2.09;
+      double rad = 0.42 + 0.12 * MathSin(t / 1900.0 + i);
+      bx[i] = rad * MathCos(ang * sgn);
+      by[i] = rad * MathSin(ang * sgn);
+   }
+   double rimR = 140 + (tr - 140) * 0.4, rimG = 225 + (tg - 225) * 0.4, rimB = 255 + (tb - 255) * 0.4;
+   const double Hx = -0.244, Hy = -0.2986, Hz = 0.9228;                      // half vector of the light (upper left)
+
+   orbCv.Erase(0);
+   int x0 = (int)MathMax(0, cx - R * 1.5), x1 = (int)MathMin(orbCW - 1, cx + R * 1.5);
+   int y0 = (int)MathMax(0, cy - R * 1.5), y1 = (int)MathMin(orbCW - 1, cy + R * 1.5);
+   double p0 = MathMod((double)now, 1100.0) / 1100.0, p1 = MathMod((double)now + 500.0, 1100.0) / 1100.0;
+
+   for(int y = y0; y <= y1; y++)
+   {
+      double dy = (y - cy) / R;
+      for(int x = x0; x <= x1; x++)
+      {
+         double dx = (x - cx) / R;
+         double r2 = dx * dx + dy * dy;
+         if(r2 > 2.25) continue;
+         double r = MathSqrt(r2);
+         double f = (1.45 - r) / 0.45;
+         double ga = (r <= 1.45) ? 100.0 * f * f * glowK : 0.0;                // glow around the sphere
+         double a, rc, gc, bc;
+         if(r <= 1.0)
+         {
+            double z = MathSqrt(1.0 - r2);
+            double omz = 1.0 - z;
+            double fres = omz * omz * (0.5 + 0.5 * omz);                        // denser towards the rim
+            double d0 = (dx - bx[0]) * (dx - bx[0]) + (dy - by[0]) * (dy - by[0]);
+            double d1 = (dx - bx[1]) * (dx - bx[1]) + (dy - by[1]) * (dy - by[1]);
+            double d2 = (dx - bx[2]) * (dx - bx[2]) + (dy - by[2]) * (dy - by[2]);
+            double g0 = MathExp(-d0 / 0.157), g1 = MathExp(-d1 / 0.157), g2 = MathExp(-d2 / 0.157);
+            double sw = g0 + g1 + g2;
+            double mr = (pr[0] * g0 + pr[1] * g1 + pr[2] * g2) / (sw + 1e-6);
+            double mg = (pg[0] * g0 + pg[1] * g1 + pg[2] * g2) / (sw + 1e-6);
+            double mb = (pb[0] * g0 + pb[1] * g1 + pb[2] * g2) / (sw + 1e-6);
+            double k = sw / (sw + 0.55);
+            rc = rimR * (1 - k) + mr * k;
+            gc = rimG * (1 - k) + mg * k;
+            bc = rimB * (1 - k) + mb * k;
+            a = 18 + 140 * fres + 150 * MathMin(1.0, sw) * (0.55 + 0.45 * z) * energy;
+            double nh = dx * Hx + dy * Hy + z * Hz;
+            if(nh > 0)                                                          // specular highlight
+            {
+               double n2 = nh * nh, n4 = n2 * n2, n8 = n4 * n4, n16 = n8 * n8, n32 = n16 * n16;
+               double sp = n32 * n16;
+               rc += (255 - rc) * sp; gc += (255 - gc) * sp; bc += (255 - bc) * sp;
+               a += 190 * sp;
+            }
+            if(r > 0.96)                                                        // blend the rim into the glow
+            {
+               double sm = (r - 0.96) / 0.04;
+               a = a * (1 - sm) + ga * sm;
+               rc = rc * (1 - sm) + tr * sm; gc = gc * (1 - sm) + tg * sm; bc = bc * (1 - sm) + tb * sm;
+            }
+         }
+         else
+         {
+            rc = tr * 0.8 + 60; gc = tg * 0.8 + 60; bc = tb * 0.8 + 60;
+            a = ga;
+            if(talking)                                                         // ripples while it talks
+            {
+               double rr0 = 1.0 + 0.42 * p0, rr1 = 1.0 + 0.42 * p1;
+               a += 120 * (1 - p0) * MathExp(-((r - rr0) * (r - rr0)) / 0.0008);
+               a += 120 * (1 - p1) * MathExp(-((r - rr1) * (r - rr1)) / 0.0008);
+            }
+         }
+         if(a < 2) continue;
+         orbCv.PixelSet(x, y, OrbARGB(U8(a), U8(rc), U8(gc), U8(bc)));
+      }
+   }
+
+   // status pill under the sphere
+   orbCv.FontSet("Segoe UI", 11, FW_BOLD);
+   int tw = orbCv.TextWidth(txt);
+   int px = (orbCW - tw) / 2 - 10, py = orbCW + 2;
+   uint pill = OrbARGB(165, 10, 14, 26);
+   orbCv.FillRectangle(px + 10, py, px + tw + 10, py + 20, pill);
+   orbCv.FillCircle(px + 10, py + 10, 10, pill);
+   orbCv.FillCircle(px + tw + 10, py + 10, 10, pill);
+   orbCv.TextOut(px + 10, py + 3, txt, OrbARGB(255, tr, tg, tb));
+   orbCv.Update();
+}
+
+void Orb_Init()
+{
+   orbPos = (int)OrbPos;
+   if(orbPos < 0 || orbPos > ORB_RIGHT_CENTER) orbPos = ORB_BESIDE_DASH;
+   if(!OrbShow) return;                          // orb switched off in the inputs: no orb and no chat box
+   int sz = (int)MathMax(80, MathMin(OrbSize, 200));
+   orbCW = (int)(sz * 1.5);
+   orbCH = orbCW + 26;
+   orbOk = orbCv.CreateBitmapLabel(ORB_OBJ, 0, 0, orbCW, orbCH, COLOR_FORMAT_ARGB_NORMALIZE);
+   if(orbOk)
+   {
+      ObjectSetInteger(0, ORB_OBJ, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, ORB_OBJ, OBJPROP_BACK, false);
+   }
+   chatHidden = GlobalVariableCheck(CHAT_GV) ? (GlobalVariableGet(CHAT_GV) > 0.5) : false;
+   if(ChatEnabled)
+   {
+      ObjectCreate(0, CHAT_BTN, OBJ_BUTTON, 0, 0, 0);          // hide / show the chat box
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_XSIZE, 110);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_YSIZE, 22);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_BGCOLOR, UI_FIELD);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_COLOR, UI_FIELD_TXT);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_BORDER_COLOR, UI_BORDER);
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_FONTSIZE, 8);
+      ObjectSetString(0, CHAT_BTN, OBJPROP_FONT, "Segoe UI");
+      ObjectSetString(0, CHAT_BTN, OBJPROP_TEXT, chatHidden ? "แสดงแชท" : "ซ่อนแชท");
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_SELECTABLE, false);
+      Chat_Create();
+      Chat_Hide(chatHidden);
+   }
+   if(SR_Enabled) SR_CreateButton();
+   orbStart = GetTickCount();
+   Orb_Place();
+   ChartRedraw();
+   Orb_Frame();
+}
+
+void Orb_Deinit()
+{
+   if(orbOk) orbCv.Destroy();
+   orbOk = false;
+}
+
+// hide / show the chat box, and re-position the orb when the chart is resized
+void Orb_Event(const int id, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == CHAT_BTN)
+   {
+      chatHidden = !chatHidden;
+      GlobalVariableSet(CHAT_GV, chatHidden ? 1.0 : 0.0);      // remembered for next time
+      ObjectSetString(0, CHAT_BTN, OBJPROP_TEXT, chatHidden ? "แสดงแชท" : "ซ่อนแชท");
+      ObjectSetInteger(0, CHAT_BTN, OBJPROP_STATE, false);
+      Chat_Hide(chatHidden);
+      Orb_Place();
+      ChartRedraw();
+   }
+   SR_Event(id, sparam);
+   if(id == CHARTEVENT_CHART_CHANGE) Orb_Place();
+}
+//==================== end of orb module ====================
+
+//==================== In-chart AI chat (text only) ====================
+// A small box under the orb: type a question, press Enter or "ส่ง". The EA posts it to  <AI_Url>/api/ea/chat  with the same
+// x-api-key / x-account headers as the other EA calls. The web answers in plain text:
+//     ok=1
+//     reply=<answer text>
+// The orb "talks" while the answer is shown. The web page chat is a different route and is not touched by this module.
+const string CH_BG = "TVE3_CHAT_BG", CH_IN = "TVE3_CHAT_IN", CH_SEND = "TVE3_CHAT_SEND", CH_LN = "TVE3_CHAT_L";
+uint chatLastSend = 0;
+
+string Chat_Esc(string s)
+{
+   string o = "";
+   for(int i = 0; i < StringLen(s); i++)
+   {
+      ushort c = StringGetCharacter(s, i);
+      if(c == '"')       o += "\\\"";
+      else if(c == '\\') o += "\\\\";
+      else if(c == '\n' || c == '\r' || c == '\t') o += " ";
+      else if(c < 32)    continue;
+      else               o += ShortToString(c);
+   }
+   return o;
+}
+
+void Chat_Show(string text)
+{
+   StringReplace(text, "\r", " ");
+   StringReplace(text, "\n", " ");
+   int n = StringLen(text), pos = 0;
+   for(int i = 0; i < CHAT_LINES; i++)
+   {
+      string ln = "";
+      if(pos < n)
+      {
+         int take = MathMin(CHAT_LINE_CH, n - pos);
+         if(pos + take < n)                                    // prefer to break at a space
+         {
+            for(int k = take - 1; k >= take / 2; k--)
+               if(StringGetCharacter(text, pos + k) == ' ') { take = k + 1; break; }
+         }
+         ln = StringSubstr(text, pos, take);
+         StringTrimLeft(ln); StringTrimRight(ln);
+         pos += take;
+         if(i == CHAT_LINES - 1 && pos < n) ln = StringSubstr(ln, 0, MathMax(0, StringLen(ln) - 3)) + "...";
+      }
+      if(ln == "") ln = " ";   // an empty text makes MT5 draw the default word "Label"
+      ObjectSetString(0, CH_LN + IntegerToString(i), OBJPROP_TEXT, ln);
+   }
+   ChartRedraw();
+}
+
+void Chat_Create()
+{
+   ObjectCreate(0, CH_BG, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, CH_BG, OBJPROP_XSIZE, CHAT_W);
+   ObjectSetInteger(0, CH_BG, OBJPROP_YSIZE, CHAT_H);
+   ObjectSetInteger(0, CH_BG, OBJPROP_BGCOLOR, UI_BG);
+   ObjectSetInteger(0, CH_BG, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, CH_BG, OBJPROP_COLOR, UI_BORDER);
+   ObjectSetInteger(0, CH_BG, OBJPROP_BACK, false);
+   ObjectSetInteger(0, CH_BG, OBJPROP_SELECTABLE, false);
+
+   ObjectCreate(0, CH_IN, OBJ_EDIT, 0, 0, 0);
+   ObjectSetInteger(0, CH_IN, OBJPROP_XSIZE, CHAT_W - 44);
+   ObjectSetInteger(0, CH_IN, OBJPROP_YSIZE, 22);
+   ObjectSetInteger(0, CH_IN, OBJPROP_BGCOLOR, UI_FIELD);
+   ObjectSetInteger(0, CH_IN, OBJPROP_COLOR, UI_FIELD_TXT);
+   ObjectSetInteger(0, CH_IN, OBJPROP_BORDER_COLOR, UI_BORDER);
+   ObjectSetInteger(0, CH_IN, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, CH_IN, OBJPROP_ALIGN, ALIGN_LEFT);
+   ObjectSetString(0, CH_IN, OBJPROP_FONT, "Segoe UI");
+   ObjectSetString(0, CH_IN, OBJPROP_TEXT, "");
+   ObjectSetInteger(0, CH_IN, OBJPROP_SELECTABLE, false);
+
+   ObjectCreate(0, CH_SEND, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_XSIZE, 40);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_YSIZE, 22);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_BGCOLOR, UI_VIOLET);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_BORDER_COLOR, UI_BORDER);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, CH_SEND, OBJPROP_FONT, "Segoe UI");
+   ObjectSetString(0, CH_SEND, OBJPROP_TEXT, "ส่ง");
+   ObjectSetInteger(0, CH_SEND, OBJPROP_SELECTABLE, false);
+
+   for(int i = 0; i < CHAT_LINES; i++)
+   {
+      string nm = CH_LN + IntegerToString(i);
+      ObjectCreate(0, nm, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, UI_FIELD_TXT);
+      ObjectSetInteger(0, nm, OBJPROP_FONTSIZE, 8);
+      ObjectSetString(0, nm, OBJPROP_FONT, "Segoe UI");
+      ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+      ObjectSetString(0, nm, OBJPROP_TEXT, " ");
+   }
+   Chat_Show("พิมพ์ถาม AI แล้วกด Enter");
+}
+
+void Chat_Place(int left, int top)
+{
+   ObjectSetInteger(0, CH_BG, OBJPROP_XDISTANCE, left);
+   ObjectSetInteger(0, CH_BG, OBJPROP_YDISTANCE, top);
+   ObjectSetInteger(0, CH_IN, OBJPROP_XDISTANCE, left + 2);
+   ObjectSetInteger(0, CH_IN, OBJPROP_YDISTANCE, top + 3);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_XDISTANCE, left + CHAT_W - 42);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_YDISTANCE, top + 3);
+   for(int i = 0; i < CHAT_LINES; i++)
+   {
+      string nm = CH_LN + IntegerToString(i);
+      ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, left + 6);
+      ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, top + 30 + i * 14);
+   }
+}
+
+void Chat_Hide(bool hide)
+{
+   long tf = hide ? OBJ_NO_PERIODS : OBJ_ALL_PERIODS;
+   ObjectSetInteger(0, CH_BG, OBJPROP_TIMEFRAMES, tf);
+   ObjectSetInteger(0, CH_IN, OBJPROP_TIMEFRAMES, tf);
+   ObjectSetInteger(0, CH_SEND, OBJPROP_TIMEFRAMES, tf);
+   for(int i = 0; i < CHAT_LINES; i++) ObjectSetInteger(0, CH_LN + IntegerToString(i), OBJPROP_TIMEFRAMES, tf);
+}
+
+void Chat_Send()
+{
+   if(!ChatEnabled) return;
+   string msg = ObjectGetString(0, CH_IN, OBJPROP_TEXT);
+   StringTrimLeft(msg); StringTrimRight(msg);
+   if(msg == "") return;
+
+   if(!licOk)                       { Chat_Show("LICENSE OFF - ใช้แชทไม่ได้"); return; }
+   if(MQLInfoInteger(MQL_TESTER))   { Chat_Show("แชทใช้ไม่ได้ใน Strategy Tester"); return; }
+   if(StringLen(AI_EAKey) == 0)     { Chat_Show("ยังไม่ได้ใส่ AI_EAKey ในอินพุต EA"); return; }
+
+   uint now = GetTickCount();
+   uint cd = (uint)(MathMax(1, ChatCooldownSec) * 1000);
+   if(chatLastSend != 0 && now - chatLastSend < cd)
+   {
+      Chat_Show("ถามถี่เกินไป รออีก " + IntegerToString((int)((cd - (now - chatLastSend)) / 1000) + 1) + " วินาที");
+      return;
+   }
+   if(StringLen(msg) > ChatMaxChars) msg = StringSubstr(msg, 0, ChatMaxChars);
+   chatLastSend = now;
+   ObjectSetString(0, CH_IN, OBJPROP_TEXT, "");
+   Chat_Show("กำลังถาม AI...");
+
+   UI_Stats();
+   string body = StringFormat("{\"symbol\":\"%s\",\"message\":\"%s\",\"price\":%.5f,\"regime\":\"%s\",\"profile\":\"%s\",\"conf\":%.2f,\"pl\":%.2f,\"buys\":%d,\"sells\":%d}",
+                              Chat_Esc(_Symbol), Chat_Esc(msg), SymbolInfoDouble(_Symbol, SYMBOL_BID),
+                              Chat_Esc(aiRegime), Chat_Esc(aiProfile), aiConfV, uiPL, uiNB, uiNS);
+
+   string resp;
+   aiBusy = true; UI_Frame(); Orb_Frame();      // robot / orb show the thinking state while the request runs
+   int code = AI_Call("POST", "/api/ea/chat", body, resp, ChatTimeoutMs);
+   int err = GetLastError();
+   aiBusy = false;
+
+   if(code != 200)
+   {
+      string m;
+      if(code == -1)       m = "เชื่อมเว็บไม่ได้ (err " + IntegerToString(err) + ") - เช็ก Allow WebRequest";
+      else if(code == 404) m = "เว็บยังไม่มี /api/ea/chat";
+      else if(code == 401 || code == 403) m = "EA key ไม่ถูกต้อง หรือไม่ตรงกับเลขบัญชี";
+      else if(code == 429) m = "ถามถี่เกินไป รอสักครู่";
+      else                 m = "เว็บตอบผิดพลาด (HTTP " + IntegerToString(code) + ")";
+      Chat_Show(m);
+      Orb_Say("CHAT ERROR", UI_AMBER, 4000);
+      return;
+   }
+
+   int p = StringFind(resp, "reply=");
+   if(p < 0) { Chat_Show("คำตอบไม่ถูกรูปแบบ"); Orb_Say("CHAT ERROR", UI_AMBER, 4000); return; }
+   string reply = StringSubstr(resp, p + 6);
+   StringTrimLeft(reply); StringTrimRight(reply);
+   if(StringLen(reply) > 300) reply = StringSubstr(reply, 0, 300);
+   if(reply == "") reply = "(ไม่มีคำตอบ)";
+
+   Chat_Show(reply);
+   int ms = (int)MathMin(12000, 3000 + StringLen(reply) * 40);   // the robot / orb "talk" while the answer is on screen
+   aiTalkUntil = GetTickCount() + (uint)ms;
+   Orb_Say("AI ตอบแล้ว", C'45,212,191', ms);
+}
+
+void Chat_Event(const int id, const string &sparam)
+{
+   if(!ChatEnabled) return;
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == CH_SEND)
+   {
+      ObjectSetInteger(0, CH_SEND, OBJPROP_STATE, false);
+      Chat_Send();
+   }
+   if(id == CHARTEVENT_OBJECT_ENDEDIT && sparam == CH_IN) Chat_Send();   // Enter
+}
+//==================== end of chat module ====================
+
+
+
+//==================== Support / Resistance + RR zones (display only) ====================
+// The button under the orb draws the nearest swing support / resistance and a 3-stage TP plan by RR, with the SL beyond the
+// nearest opposite swing. Side: the basket the EA holds on this symbol (entry = its average price); with no position, the EMA trend,
+// else the nearer level. Pure display: nothing here sends, modifies or closes an order.
+void SR_Btn_Look()
+{
+   ObjectSetString(0, SR_BTN, OBJPROP_TEXT, srOn ? "ซ่อน S/R + RR" : "แสดง S/R + RR");
+   ObjectSetInteger(0, SR_BTN, OBJPROP_BGCOLOR, srOn ? UI_BLUE : UI_FIELD);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_STATE, false);
+}
+
+void SR_CreateButton()
+{
+   srOn = GlobalVariableCheck(SR_GV) ? (GlobalVariableGet(SR_GV) > 0.5) : false;
+   srH_atr = iATR(_Symbol, SR_TF, 14);
+   ObjectCreate(0, SR_BTN, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_XSIZE, 110);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_YSIZE, 22);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_COLOR, UI_FIELD_TXT);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_BORDER_COLOR, UI_BORDER);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, SR_BTN, OBJPROP_FONT, "Segoe UI");
+   ObjectSetInteger(0, SR_BTN, OBJPROP_SELECTABLE, false);
+   SR_Btn_Look();
+}
+
+void SR_PlaceButton(int x, int y)
+{
+   ObjectSetInteger(0, SR_BTN, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, SR_BTN, OBJPROP_YDISTANCE, y);
+}
+
+void SR_Deinit()
+{
+   if(srH_atr != INVALID_HANDLE) IndicatorRelease(srH_atr);
+   srH_atr = INVALID_HANDLE;
+}
+
+// nearest confirmed swing high above / swing low below `ref` on SR_TF (0 = none found)
+bool SR_Levels(double ref, double &sup, double &res)
+{
+   sup = 0; res = 0;
+   int N = (int)MathMax(2, MathMin(SR_SwingBars, 20));
+   int lb = (int)MathMax(60, MathMin(SR_Lookback, 1000));
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int got = CopyRates(_Symbol, SR_TF, 0, lb, r);
+   if(got < 2 * N + 3) return false;
+   for(int i = N + 1; i < got - N; i++)                    // i >= N+1: the forming bar is never part of a swing
+   {
+      bool hi = true, lo = true;
+      for(int k = 1; k <= N && (hi || lo); k++)
+      {
+         if(r[i].high <= r[i - k].high || r[i].high <= r[i + k].high) hi = false;
+         if(r[i].low  >= r[i - k].low  || r[i].low  >= r[i + k].low)  lo = false;
+      }
+      if(hi && r[i].high > ref && (res == 0 || r[i].high < res)) res = r[i].high;
+      if(lo && r[i].low  < ref && (sup == 0 || r[i].low  > sup)) sup = r[i].low;
+   }
+   return (sup > 0 || res > 0);
+}
+
+// time at the left edge of the labels: just right of the dashboard (and of the orb when it sits beside the dashboard)
+datetime SR_LabelTime()
+{
+   int W = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   int x = ORB_DASH_RIGHT + 20 + ((orbOk && orbPos == ORB_BESIDE_DASH) ? orbCW + OrbMargin : 0);
+   if(x > W - 120) x = W / 2;
+   datetime t = 0; double pr = 0; int sw = 0;
+   if(ChartXYToTimePrice(0, x, 20, sw, t, pr) && t > 0) return t;
+   return iTime(_Symbol, _Period, 0);
+}
+
+void SR_Line(string nm, double price, color c, ENUM_LINE_STYLE st, int w)
+{
+   string o = SR_PFX + nm;
+   if(ObjectFind(0, o) < 0)
+   {
+      ObjectCreate(0, o, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, o, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, o, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, o, OBJPROP_BACK, true);
+   }
+   ObjectSetDouble(0, o, OBJPROP_PRICE, price);
+   ObjectSetInteger(0, o, OBJPROP_COLOR, c);
+   ObjectSetInteger(0, o, OBJPROP_STYLE, st);
+   ObjectSetInteger(0, o, OBJPROP_WIDTH, w);
+}
+
+void SR_Text(string nm, string txt, datetime t, double price, color c)
+{
+   string o = SR_PFX + "T_" + nm;
+   if(ObjectFind(0, o) < 0)
+   {
+      ObjectCreate(0, o, OBJ_TEXT, 0, t, price);
+      ObjectSetInteger(0, o, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, o, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, o, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+      ObjectSetInteger(0, o, OBJPROP_FONTSIZE, 8);
+      ObjectSetString(0, o, OBJPROP_FONT, "Segoe UI");
+   }
+   ObjectSetInteger(0, o, OBJPROP_TIME, 0, t);
+   ObjectSetDouble(0, o, OBJPROP_PRICE, 0, price);
+   ObjectSetString(0, o, OBJPROP_TEXT, txt);
+   ObjectSetInteger(0, o, OBJPROP_COLOR, c);
+}
+
+void SR_Rect(string nm, datetime t1, datetime t2, double p1, double p2, color c)
+{
+   string o = SR_PFX + nm;
+   if(ObjectFind(0, o) < 0)
+   {
+      ObjectCreate(0, o, OBJ_RECTANGLE, 0, t1, p1, t2, p2);
+      ObjectSetInteger(0, o, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, o, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, o, OBJPROP_BACK, true);
+      ObjectSetInteger(0, o, OBJPROP_FILL, true);
+   }
+   ObjectSetInteger(0, o, OBJPROP_TIME, 0, t1);
+   ObjectSetInteger(0, o, OBJPROP_TIME, 1, t2);
+   ObjectSetDouble(0, o, OBJPROP_PRICE, 0, p1);
+   ObjectSetDouble(0, o, OBJPROP_PRICE, 1, p2);
+   ObjectSetInteger(0, o, OBJPROP_COLOR, c);
+}
+
+// remove the RR plan only (S/R lines stay)
+void SR_DelPlan()
+{
+   string n[] = {"E", "SL", "TP1", "TP2", "TP3", "Z_SL", "Z_1", "Z_2", "Z_3", "T_E", "T_SL", "T_TP1", "T_TP2", "T_TP3"};
+   for(int i = 0; i < ArraySize(n); i++) ObjectDelete(0, SR_PFX + n[i]);
+}
+
+string SR_Pts(double dist) { return IntegerToString((int)MathRound(dist / _Point)); }
+
+void SR_Update(uint gap)
+{
+   if(!srOn || !SR_Enabled) return;
+   uint now = GetTickCount();
+   if(gap > 0 && srLastT != 0 && now - srLastT < gap) return;
+   srLastT = now;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID), ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return;
+
+   double supM = 0, resM = 0;
+   if(!SR_Levels(bid, supM, resM))
+   {
+      ObjectsDeleteAll(0, SR_PFX);
+      if(gap == 0) Orb_Say("ไม่พบแนวรับ/ต้าน", UI_AMBER, 4000);
+      ChartRedraw();
+      return;
+   }
+
+   // which side, and at what price?
+   double vb = 0, vs = 0, pb = 0, ps = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      double v = PositionGetDouble(POSITION_VOLUME), po = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) { vb += v; pb += po * v; }
+      else                                                      { vs += v; ps += po * v; }
+   }
+   int side = 0;
+   double entry = 0;
+   string why = "";
+   if(vb + vs > 0)
+   {
+      side = (vb >= vs) ? 1 : -1;
+      entry = (side > 0) ? pb / vb : ps / vs;
+      why = "ไม้ที่ถืออยู่ (ราคาเฉลี่ย)";
+   }
+   else
+   {
+      int tm = 0, cr = 0;
+      GetEMAData(tm, cr);
+      if(tm == 1)       { side = 1;  why = "ตามเทรนด์ EMA"; }
+      else if(tm == -1) { side = -1; why = "ตามเทรนด์ EMA"; }
+      else
+      {
+         side = (supM > 0 && (resM == 0 || bid - supM <= resM - bid)) ? 1 : -1;
+         why = "ตามแนวที่ใกล้ราคาสุด";
+      }
+      entry = (side > 0) ? ask : bid;
+   }
+
+   datetime tL = SR_LabelTime();
+   datetime tR = iTime(_Symbol, _Period, 0) + (datetime)((long)PeriodSeconds(_Period) * 300);
+   color cSup = C'64,196,255', cRes = UI_AMBER;
+
+   // support / resistance around the current price
+   if(supM > 0) { SR_Line("SUP", supM, cSup, STYLE_SOLID, 2); SR_Text("SUP", "แนวรับ " + DoubleToString(supM, _Digits), tL, supM, cSup); }
+   else         { ObjectDelete(0, SR_PFX + "SUP"); ObjectDelete(0, SR_PFX + "T_SUP"); }
+   if(resM > 0) { SR_Line("RES", resM, cRes, STYLE_SOLID, 2); SR_Text("RES", "แนวต้าน " + DoubleToString(resM, _Digits), tL, resM, cRes); }
+   else         { ObjectDelete(0, SR_PFX + "RES"); ObjectDelete(0, SR_PFX + "T_RES"); }
+
+   // SL beyond the nearest opposite swing, seen from the entry price
+   double supE = supM, resE = resM;
+   if(MathAbs(entry - bid) > 10 * _Point) SR_Levels(entry, supE, resE);
+   double base = (side > 0) ? supE : resE;
+   double risk = 0, sl = 0;
+   if(base > 0)
+   {
+      double atr = 0;
+      double ab[1];
+      if(srH_atr != INVALID_HANDLE && CopyBuffer(srH_atr, 0, 1, 1, ab) > 0) atr = ab[0];
+      sl = (side > 0) ? base - SR_BufferATR * atr : base + SR_BufferATR * atr;
+      risk = MathAbs(entry - sl);
+   }
+   if(risk <= 0)
+   {
+      SR_DelPlan();
+      if(gap == 0) Orb_Say("ไม่พบแนวสำหรับ SL", UI_AMBER, 4000);
+      ChartRedraw();
+      return;
+   }
+
+   double rr[3];
+   rr[0] = MathMax(0.1, SR_RR1); rr[1] = MathMax(0.1, SR_RR2); rr[2] = MathMax(0.1, SR_RR3);
+   double tp[3];
+   for(int k = 0; k < 3; k++) tp[k] = entry + side * rr[k] * risk;
+
+   color cE = C'226,236,255', cSL = UI_RED, cTP = UI_GREEN;
+   SR_Line("E", entry, cE, STYLE_DOT, 1);
+   SR_Text("E", "ENTRY " + (side > 0 ? "BUY " : "SELL ") + DoubleToString(entry, _Digits) + "  (" + why + ")", tL, entry, cE);
+   SR_Line("SL", sl, cSL, STYLE_DASH, 1);
+   SR_Text("SL", "SL " + DoubleToString(sl, _Digits) + "  (-" + SR_Pts(risk) + " pts)", tL, sl, cSL);
+   for(int k = 0; k < 3; k++)
+   {
+      string nm = "TP" + IntegerToString(k + 1);
+      SR_Line(nm, tp[k], cTP, STYLE_DASH, 1);
+      SR_Text(nm, nm + "  " + DoubleToString(rr[k], 1) + "R  " + DoubleToString(tp[k], _Digits) + "  (+" + SR_Pts(rr[k] * risk) + " pts)", tL, tp[k], cTP);
+   }
+
+   if(SR_FillZones)
+   {
+      SR_Rect("Z_SL", tL, tR, entry, sl,    C'70,24,38');
+      SR_Rect("Z_1",  tL, tR, entry, tp[0], C'12,48,40');
+      SR_Rect("Z_2",  tL, tR, tp[0], tp[1], C'14,62,50');
+      SR_Rect("Z_3",  tL, tR, tp[1], tp[2], C'16,78,62');
+   }
+   else
+   {
+      ObjectDelete(0, SR_PFX + "Z_SL"); ObjectDelete(0, SR_PFX + "Z_1"); ObjectDelete(0, SR_PFX + "Z_2"); ObjectDelete(0, SR_PFX + "Z_3");
+   }
+   ChartRedraw();
+}
+
+void SR_Tick() { SR_Update(2000); }
+
+void SR_Event(const int id, const string &sparam)
+{
+   if(!SR_Enabled) return;
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == SR_BTN)
+   {
+      srOn = !srOn;
+      GlobalVariableSet(SR_GV, srOn ? 1.0 : 0.0);              // remembered for next time
+      SR_Btn_Look();
+      if(srOn)
+      {
+         SR_Update(0);
+         Orb_Say("S/R + RR ON", UI_AMBER, 3000);
+      }
+      else
+      {
+         ObjectsDeleteAll(0, SR_PFX);
+         ChartRedraw();
+      }
+   }
+   if(id == CHARTEVENT_CHART_CHANGE && srOn) SR_Update(300);   // labels follow the chart when it is scrolled / resized
+}
+//==================== end of S/R + RR module ====================
+
+
+//+------------------------------------------------------------------+
+//| STEP 1: HELPERS                                                  |
+//+------------------------------------------------------------------+
+double GetSafeVal(CChartObjectEdit &obj, double btVal) {
+    string txt = obj.Description();
+    if(txt == "" || txt == " " || StringToDouble(txt) < 0) return btVal;
+    return StringToDouble(txt);
+}
+
+string GetTxt(CChartObjectEdit &obj, string btTxt) {
+    string txt = obj.Description();
+    if(txt == "" || txt == " ") return btTxt;
+    return txt;
+}
+
+int GetMinsFromDashboard(string timeStr) {
+    string result[];
+    int k = StringSplit(timeStr, ':', result);
+    if(k < 2) return 0;
+    return ((int)StringToInteger(result[0]) * 60) + (int)StringToInteger(result[1]);
+}
+
+double GetWalletAmount() {
+   if(!GlobalVariableCheck(GV_WALLET_NAME)) GlobalVariableSet(GV_WALLET_NAME, 0.0);
+   return GlobalVariableGet(GV_WALLET_NAME);
+}
+
+void SaveWalletAmount(double amount) {
+   GlobalVariableSet(GV_WALLET_NAME, amount);
+   if(ObjectFind(0, "TVE3_E_WalletVal") >= 0) ebWalletDisp.Description(DoubleToString(amount, 2) + " $");
+}
+
+int GetSideCount(ENUM_POSITION_TYPE type) {
+    int c = 0;
+    for(int i = PositionsTotal()-1; i >= 0; i--) {
+        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetInteger(POSITION_TYPE) == type) c++;
+    }
+    return c;
+}
+
+void CloseBySide(int side) {
+    for(int i = PositionsTotal()-1; i >= 0; i--) {
+        ulong t = PositionGetTicket(i);
+        if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum) {
+            if(side == -1 || PositionGetInteger(POSITION_TYPE) == side) trade.PositionClose(t);
+        }
+    }
+}
+
+// โครงสร้างดึงค่า EMA 3 เส้น และระบุแนวโน้ม/การตัดกัน
+// trendMain: 1 = EMA50 > EMA200 (Buy Only), -1 = EMA50 < EMA200 (Sell Only), 0 = ไม่ชัดเจน
+// crossVF_F: 1 = EMA5 > EMA50, -1 = EMA5 < EMA50
+bool GetEMAData(int &trendMain, int &crossVF_F) {
+    trendMain = 0; crossVF_F = 0;
+    if(!UseEMA) return true;
+
+    int vf_p = (int)GetSafeVal(ebEMAVF, (double)InpEMAVFast);
+    int f_p  = (int)GetSafeVal(ebEMAF, (double)InpEMAFast);
+    int s_p  = (int)GetSafeVal(ebEMAS, (double)InpEMASlow);
+    
+    static int lvf = 0, lf = 0, ls = 0;
+    if(vf_p != lvf || f_p != lf || s_p != ls) {
+        if(handleVFast != INVALID_HANDLE) IndicatorRelease(handleVFast);
+        if(handleFast != INVALID_HANDLE) IndicatorRelease(handleFast);
+        if(handleSlow != INVALID_HANDLE) IndicatorRelease(handleSlow);
+        
+        handleVFast = iMA(_Symbol, _Period, vf_p, 0, MODE_EMA, PRICE_CLOSE);
+        handleFast  = iMA(_Symbol, _Period, f_p, 0, MODE_EMA, PRICE_CLOSE);
+        handleSlow  = iMA(_Symbol, _Period, s_p, 0, MODE_EMA, PRICE_CLOSE);
+        lvf = vf_p; lf = f_p; ls = s_p;
+    }
+    
+    if(handleVFast == INVALID_HANDLE || handleFast == INVALID_HANDLE || handleSlow == INVALID_HANDLE) return false;
+    
+    double vf[1], f_cross[1], f_trend[1], s[1];
+    int shT = MathMax(0, InpShiftTrend);
+    int shC = MathMax(0, InpShiftCross);
+
+    if(CopyBuffer(handleVFast, 0, shC, 1, vf)       <= 0 ||
+       CopyBuffer(handleFast,  0, shC, 1, f_cross)  <= 0 ||
+       CopyBuffer(handleFast,  0, shT, 1, f_trend)  <= 0 ||
+       CopyBuffer(handleSlow,  0, shT, 1, s)        <= 0) return false;
+
+    // โลจิก 1: เทรนด์หลัก EMA50 vs EMA200 (ใช้ shift ของเทรนด์)
+    if(f_trend[0] > s[0]) trendMain = 1;        // Buy Only
+    else if(f_trend[0] < s[0]) trendMain = -1;  // Sell Only
+
+    // โลจิก 2: EMA5 vs EMA50 (ใช้ shift ของสัญญาณตัด)
+    if(vf[0] > f_cross[0]) crossVF_F = 1;
+    else if(vf[0] < f_cross[0]) crossVF_F = -1;
+
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| STEP 2: RECOVERY LOGIC                                           |
+//+------------------------------------------------------------------+
+// ===== DIAGNOSTIC: บอกเหตุผลทุกครั้งที่ EA สั่งปิดออเดอร์ (ดูที่แท็บ Experts + ข้อความใต้ลูกบอล) =====
+void LogClose(string why, double pl) {
+    Print("TVE CLOSE >>> ", why, " | P/L ", DoubleToString(pl, 2));
+    Orb_Say("CLOSE: " + why, UI_AMBER, 8000);
+}
+
+void LogState(string tag) {
+    int tm = 0, cr = 0; GetEMAData(tm, cr);
+    Print("TVE STATE [", tag, "] trendMain=", tm, " cross=", cr, " UseEMA=", UseEMA,
+          " wallet=", DoubleToString(GetWalletAmount(), 2),
+          " MaxProfitB=", DoubleToString(MaxProfitB, 2), " MaxProfitS=", DoubleToString(MaxProfitS, 2),
+          " LossB=", DoubleToString(LossToRecoverB, 2), " LossS=", DoubleToString(LossToRecoverS, 2),
+          " TPnormB=", GetSafeVal(ebTPB_D, InpTP_Normal), " TPnormS=", GetSafeVal(ebTPS_D, InpTP_Normal),
+          " ExitPips=", GetSafeVal(ebExitPips, (double)InpEMACrossPips), " AI=", aiOn);
+}
+
+void CloseAndReset(ENUM_POSITION_TYPE type, double profit) {
+    double netProfit = profit; 
+    bool debtCleared = false;
+    
+    if(type == POSITION_TYPE_BUY) {
+        if(LossToRecoverB > 0) {
+            double debtBefore = LossToRecoverB;
+            LossToRecoverB -= netProfit;
+            if(LossToRecoverB <= 0.01) { LossToRecoverB = 0; RecCountB = 0; debtCleared = true; netProfit -= debtBefore; } 
+            else netProfit = 0; 
+        } else debtCleared = true;
+        MaxProfitB = 0;
+    } else {
+        if(LossToRecoverS > 0) {
+            double debtBefore = LossToRecoverS;
+            LossToRecoverS -= netProfit;
+            if(LossToRecoverS <= 0.01) { LossToRecoverS = 0; RecCountS = 0; debtCleared = true; netProfit -= debtBefore; } 
+            else netProfit = 0; 
+        } else debtCleared = true;
+        MaxProfitS = 0;
+    }
+
+    if(debtCleared && netProfit > 0.01) {
+        double amountToShare = netProfit * (1.0 - (InpHarvestPct/100.0)); 
+        if(type == POSITION_TYPE_BUY && LossToRecoverS > 0) {
+            LossToRecoverS -= amountToShare;
+            if(LossToRecoverS <= 0.01) { LossToRecoverS = 0; RecCountS = 0; } 
+        } else if(type == POSITION_TYPE_SELL && LossToRecoverB > 0) {
+            LossToRecoverB -= amountToShare;
+            if(LossToRecoverB <= 0.01) { LossToRecoverB = 0; RecCountB = 0; } 
+        }
+    }
+
+    if(InpUseWallet) SaveWalletAmount(GetWalletAmount() + (profit * (InpHarvestPct/100.0)));
+    CloseBySide((int)type);
+}
+
+void UpdateRecoveryGUI() { 
+   if(ObjectFind(0, "TVE3_E_B_REC") >= 0) ebRecB.Description(DoubleToString(LossToRecoverB,1)+" ("+(string)RecCountB+")"); 
+   if(ObjectFind(0, "TVE3_E_S_REC") >= 0) ebRecS.Description(DoubleToString(LossToRecoverS,1)+" ("+(string)RecCountS+")"); 
+}
+
+//+------------------------------------------------------------------+
+//| STEP 3: GRID LOGIC (อัปเดตโลจิกเงื่อนไข EMA 5 / 50 / 200 ใหม่)        |
+//+------------------------------------------------------------------+
+void ManageGrid(ENUM_ORDER_TYPE type, double lot, double lMult, int step, int maxO, int trendMain, int crossVF_F, bool isTime) {
+    datetime curBar = iTime(_Symbol, _Period, 0);
+    int cnt = GetSideCount((ENUM_POSITION_TYPE)type);
+    if(!licOk) return;   // licence off: no new orders (exits still run)
+    
+    if(InpOnlyNewBar && cnt > 0) {
+        if((type == ORDER_TYPE_BUY && curBar == lastBarTimeB) || (type == ORDER_TYPE_SELL && curBar == lastBarTimeS)) return;
+    }
+    
+    // 1. เงื่อนไขควบคุมล็อคฝั่งเทรนด์: ห้ามซื้ออีกฝั่งเด็ดขาดถ้า EMA 50 ยังไม่ตัดยืนยันเหนือ/ใต้ EMA 200
+    if(UseEMA) {
+        if(type == ORDER_TYPE_BUY && trendMain != 1) return;  // ถ้า 50 ไม่ได้อยู่เหนือ 200 ห้ามเปิด BUY ทั้งไม้แรกและไม้แก้
+        if(type == ORDER_TYPE_SELL && trendMain != -1) return; // ถ้า 50 ไม่ได้อยู่ใต้ 200 ห้ามเปิด SELL ทั้งไม้แรกและไม้แก้
+    }
+
+    // 1.5 รอ EMA5 ตัดมาฝั่งเดียวกับเทรนด์ก่อนเปิดไม้ (ตั้งเปิด/ปิดได้ที่ Inputs)
+    if(UseEMA && InpWaitCross && (cnt > 0 || InpWaitCrossFirst)) {
+        if(type == ORDER_TYPE_BUY  && crossVF_F != 1)  return;
+        if(type == ORDER_TYPE_SELL && crossVF_F != -1) return;
+    }
+    
+    // คำนวณ Lot ไม้แรก/ไม้แก้แค้น
+    double currentBaseLot = lot; 
+    if(type == ORDER_TYPE_BUY && LossToRecoverB > 0) currentBaseLot = lot * MathPow(g_RecMult, RecCountB);
+    if(type == ORDER_TYPE_SELL && LossToRecoverS > 0) currentBaseLot = lot * MathPow(g_RecMult, RecCountS);
+
+    double finalLot = currentBaseLot * MathPow(lMult, cnt);
+    double lastP = 0; 
+    for(int i = PositionsTotal()-1; i >= 0; i--) {
+        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetInteger(POSITION_TYPE) == (ENUM_POSITION_TYPE)type) {
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(lastP == 0 || (type == ORDER_TYPE_BUY && op < lastP) || (type == ORDER_TYPE_SELL && op > lastP)) lastP = op;
+        }
+    }
+
+    // ตรวจสอบเงื่อนไข Auto Dashboard และเวลาทำงาน
+    if(cnt == 0 && (!isTime || (type == ORDER_TYPE_BUY && !AutoB) || (type == ORDER_TYPE_SELL && !AutoS))) return;
+    if(cnt >= maxO) return;
+
+    // 2. เงื่อนไขการเลือกใช้ Step Multiplier: 
+    // เริ่มใช้ Step Mult (A) ก็ต่อเมื่อ EMA 5 วิ่งตัดสวนเส้น EMA 50 เท่านั้น
+    double chosenStepMult = InpStepMult; // ค่าเริ่มต้นเป็นตัวคูณปกติ (Wide)
+    if(UseEMA) {
+        if(type == ORDER_TYPE_BUY && crossVF_F == -1) chosenStepMult = InpStepMultAg; // ไม้ BUY แต่ EMA5 ตัดลงใต้ EMA50 (ราคากำลังลงลึก ให้ทับถม Aggressive)
+        if(type == ORDER_TYPE_SELL && crossVF_F == 1) chosenStepMult = InpStepMultAg; // ไม้ SELL แต่ EMA5 ตัดขึ้นเหนือ EMA50 (ราคากำลังลากขึ้น ให้ทับถม Aggressive)
+    }
+
+    double currP = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    bool can = (cnt == 0) || ((type == ORDER_TYPE_BUY && (lastP - currP) >= (step * MathPow(chosenStepMult, cnt-1) * _Point)) || (type == ORDER_TYPE_SELL && (currP - lastP) >= (step * MathPow(chosenStepMult, cnt-1) * _Point)));
+    
+    if(can) {
+        double lotN = NormalizeDouble(MathMin(finalLot, InpMaxLot), 2);
+        if(trade.PositionOpen(_Symbol, type, lotN, currP, 0, 0)) { 
+            if(type == ORDER_TYPE_BUY) lastBarTimeB = curBar; else lastBarTimeS = curBar; 
+        }
+    }
+}
+
+void CheckExit(ENUM_ORDER_TYPE type, double tpUSD) {
+    double p = 0; int cnt = 0;
+    double target = tpUSD + (type == ORDER_TYPE_BUY ? LossToRecoverB : LossToRecoverS);
+    for(int i = PositionsTotal()-1; i >= 0; i--) {
+        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetInteger(POSITION_TYPE) == (ENUM_POSITION_TYPE)type) {
+            p += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP); cnt++;
+        }
+    }
+    if(cnt > 0) {
+        if(InpUseTrailUSD) {
+            double mP = (type == ORDER_TYPE_BUY) ? MaxProfitB : MaxProfitS;
+            if(p > mP) { if(type == ORDER_TYPE_BUY) MaxProfitB = p; else MaxProfitS = p; mP = p; }
+            if(mP >= InpTrailStartUSD && p <= (mP - InpTrailLockUSD)) { LogClose("TRAILING maxP=" + DoubleToString(mP, 2), p); CloseAndReset((ENUM_POSITION_TYPE)type, p); return; }
+        }
+        if(p >= target && target > 0.05) { LogClose("TP target=" + DoubleToString(target, 2), p); CloseAndReset((ENUM_POSITION_TYPE)type, p); }
+    }
+}
+
+// ปิดด้วยมือ: ถ้าฝั่งนั้นขาดทุนอยู่ ให้เก็บยอดขาดทุนเข้า LossToRecover + นับ RecCount เหมือนตอน EMA Cross Exit
+// side: 0 = BUY, 1 = SELL, -1 = ทั้งหมด
+void ManualClose(int side) {
+    if(InpManualLossToRec) {
+        double pB = 0, pS = 0; int nB = 0, nS = 0;
+        for(int i = PositionsTotal()-1; i >= 0; i--) {
+            ulong tk = PositionGetTicket(i);
+            if(tk == 0 || !PositionSelectByTicket(tk)) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum) continue;
+            double pr = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) { pB += pr; nB++; }
+            else                                                      { pS += pr; nS++; }
+        }
+        if((side == 0 || side == -1) && nB > 0) {
+            if(pB < 0) {
+                RecCountB++; LossToRecoverB += MathAbs(pB);
+                if(RecCountB > InpMaxRecAttempts) { LossToRecoverB = 0; RecCountB = 0; }
+            }
+            MaxProfitB = 0;
+        }
+        if((side == 1 || side == -1) && nS > 0) {
+            if(pS < 0) {
+                RecCountS++; LossToRecoverS += MathAbs(pS);
+                if(RecCountS > InpMaxRecAttempts) { LossToRecoverS = 0; RecCountS = 0; }
+            }
+            MaxProfitS = 0;
+        }
+    }
+    LogClose("MANUAL BUTTON", 0.0);
+    // ปิดมือจนไม่เหลือไม้ของ EA เลย -> ล้าง Wallet
+    bool willBeEmpty = (side == -1) ||
+                       (side == 0 && GetSideCount(POSITION_TYPE_SELL) == 0) ||
+                       (side == 1 && GetSideCount(POSITION_TYPE_BUY)  == 0);
+    if(InpManualClearWallet && willBeEmpty) {
+        Print("TVE WALLET cleared (was ", DoubleToString(GetWalletAmount(), 2), ")");
+        SaveWalletAmount(0.0);
+    }
+    CloseBySide(side);
+}
+
+void CheckEMACrossExit(ENUM_ORDER_TYPE type, int trendMain) {
+    if(!InpUseEMACrossExit) return;
+    double tp = 0; int cnt = 0; double tv=0, twp=0;
+    for(int i = PositionsTotal()-1; i >= 0; i--) {
+        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum && PositionGetInteger(POSITION_TYPE) == (ENUM_POSITION_TYPE)type) {
+            tp += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            tv += PositionGetDouble(POSITION_VOLUME);
+            twp += PositionGetDouble(POSITION_PRICE_OPEN) * PositionGetDouble(POSITION_VOLUME);
+            cnt++;
+        }
+    }
+    if(cnt > 0) {
+        double avg = twp / tv; double cur = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double pips = GetSafeVal(ebExitPips, (double)InpEMACrossPips);
+        
+        // การเช็ค Exit สวนเทรนด์อิงตามความสัมพันธ์ของเทรนด์หลัก EMA50/200
+        if(((type == ORDER_TYPE_BUY && trendMain == -1) || (type == ORDER_TYPE_SELL && trendMain == 1)) && ((type == ORDER_TYPE_BUY ? avg-cur : cur-avg) / _Point) >= pips) {
+            if(type == ORDER_TYPE_BUY) { 
+                RecCountB++; LossToRecoverB += MathAbs(tp); 
+                if(RecCountB > InpMaxRecAttempts) { LossToRecoverB = 0; RecCountB = 0; } 
+            }
+            else { 
+                RecCountS++; LossToRecoverS += MathAbs(tp); 
+                if(RecCountS > InpMaxRecAttempts) { LossToRecoverS = 0; RecCountS = 0; } 
+            }
+            LogClose("EMA CROSS EXIT", tp);
+            CloseBySide((int)type);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| STEP 4: DASHBOARD                                                |
+//+------------------------------------------------------------------+
+void CreateRow(string l, CChartObjectEdit &e, string v, int x, int y, string side, string suffix) { 
+    string nL="TVE3_L_"+side+suffix; string nE="TVE3_E_"+side+"_"+suffix; 
+    ObjectCreate(0, nL, OBJ_LABEL, 0, 0, 0); ObjectSetInteger(0, nL, OBJPROP_XDISTANCE, x); ObjectSetInteger(0, nL, OBJPROP_YDISTANCE, y); 
+    ObjectSetString(0, nL, OBJPROP_TEXT, l); ObjectSetString(0, nL, OBJPROP_FONT, "Segoe UI"); ObjectSetInteger(0, nL, OBJPROP_COLOR, UI_TXT_DIM); 
+    e.Create(0, nE, 0, x+120, y-2, 65, 18); e.Description(v); UI_StyleEdit(e, nE); 
+}
+
+void CreateB(CChartObjectButton &o, string n, string t, int x, int y, int xs, int ys, color b) { 
+    o.Create(0, n, 0, x, y, xs, ys); o.Description(t); o.BackColor(b); o.Color(clrWhite); o.FontSize(9); o.Selectable(false);
+    ObjectSetInteger(0, n, OBJPROP_BORDER_COLOR, UI_BORDER); ObjectSetString(0, n, OBJPROP_FONT, "Segoe UI"); 
+}
+
+// ปุ่ม RESET Wallet: กดครั้งแรกจะเปลี่ยนเป็น SURE? (3 วินาที) กดซ้ำเพื่อยืนยัน กันกดพลาด
+uint rwArm = 0;
+void RW_Look(bool armed) {
+    btnRW.Description(armed ? "SURE?" : "RESET");
+    btnRW.BackColor(armed ? UI_RED_ON : UI_AMBER);
+    ObjectSetInteger(0, "TVE3_RW", OBJPROP_STATE, false);
+}
+void RW_Click() {
+    uint now = GetTickCount();
+    if(rwArm != 0 && now - rwArm <= 3000) {
+        Print("TVE WALLET reset by button (was ", DoubleToString(GetWalletAmount(), 2), ")");
+        SaveWalletAmount(0.0);
+        rwArm = 0;
+        RW_Look(false);
+    } else {
+        rwArm = now;
+        RW_Look(true);
+    }
+    ChartRedraw();
+}
+void RW_Tick() {
+    if(rwArm != 0 && GetTickCount() - rwArm > 3000) { rwArm = 0; RW_Look(false); ChartRedraw(); }
+}
+
+void DrawDashboard() {
+    int x1 = 20, x2 = 235, y = 20 + HDR_H, w = 195, sp = 18;
+    
+    string bgName = "TVE3_BG_Panel";
+    ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x1 - 10);      
+    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, 10);      
+    ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 440);             
+    ObjectSetInteger(0, bgName, OBJPROP_YSIZE, 608); // พื้นหลังแผง: สั้นลงให้พอดีกับปุ่ม AI Profile ที่ย้ายขึ้นมา             
+    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, UI_BG);   
+    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, bgName, OBJPROP_COLOR, UI_BORDER);
+    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, bgName, OBJPROP_BACK, false);            
+    
+    CreateB(btnAB, "TVE3_AB", (AutoB?"AutoBuy: ON":"AutoBuy: OFF"), x1, y, w, 25, (AutoB?UI_GREEN_ON:UI_GREEN_DIM));
+    int ty = y+30;
+    CreateRow("Lot Start", ebLotB, DoubleToString(InpLot, 2), x1, ty, "B", "LOT"); ty+=sp;
+    CreateRow("Lot Mult (x)", ebLMultB, DoubleToString(InpLotMult, 1), x1, ty, "B", "MULT"); ty+=sp;
+    CreateRow("Step (Pts)", ebStepB, IntegerToString(InpStep), x1, ty, "B", "STEP"); ty+=sp;
+    CreateRow("Step Mult (W)", ebSMB, DoubleToString(InpStepMult, 1), x1, ty, "B", "SMW"); ty+=sp;
+    CreateRow("Step Mult (A)", ebSMAB, DoubleToString(InpStepMultAg, 1), x1, ty, "B", "SMA"); ty+=sp;
+    CreateRow("Max Order", ebMaxB, IntegerToString(InpMax), x1, ty, "B", "MAX"); ty+=sp;
+    CreateRow("TP Normal ($)", ebTPB_D, DoubleToString(InpTP_Normal, 1), x1, ty, "B", "TPN"); ty+=sp;
+    CreateRow("TP Old ($)", ebTPO_B, DoubleToString(InpTP_OldTrend, 1), x1, ty, "B", "TPO"); ty+=sp;
+    CreateRow("Rec Stat", ebRecB, "0.0 (0)", x1, ty, "B", "REC"); ty+=sp+10;
+    CreateB(btnB, "TVE3_B", "BUY NOW", x1, ty, w, 30, UI_GREEN_ON); ty+=35;
+    CreateB(btnCB, "TVE3_CB", "CLOSE BUY", x1, ty, w, 20, UI_GREEN_DIM);
+
+    CreateB(btnAS, "TVE3_AS", (AutoS?"AutoSell: ON":"AutoSell: OFF"), x2, y, w, 25, (AutoS?UI_RED_ON:UI_RED_DIM));
+    ty = y+30;
+    CreateRow("Lot Start", ebLotS, DoubleToString(InpLot, 2), x2, ty, "S", "LOT"); ty+=sp;
+    CreateRow("Lot Mult (x)", ebLMultS, DoubleToString(InpLotMult, 1), x2, ty, "S", "MULT"); ty+=sp;
+    CreateRow("Step (Pts)", ebStepS, IntegerToString(InpStep), x2, ty, "S", "STEP"); ty+=sp;
+    CreateRow("Step Mult (W)", ebSMS, DoubleToString(InpStepMult, 1), x2, ty, "S", "SMW"); ty+=sp;
+    CreateRow("Step Mult (A)", ebSMAS, DoubleToString(InpStepMultAg, 1), x2, ty, "S", "SMA"); ty+=sp;
+    CreateRow("Max Order", ebMaxS, IntegerToString(InpMax), x2, ty, "S", "MAX"); ty+=sp;
+    CreateRow("TP Normal ($)", ebTPS_D, DoubleToString(InpTP_Normal, 1), x2, ty, "S", "TPN"); ty+=sp;
+    CreateRow("TP Old ($)", ebTPO_S, DoubleToString(InpTP_OldTrend, 1), x2, ty, "S", "TPO"); ty+=sp;
+    CreateRow("Rec Stat", ebRecS, "0.0 (0)", x2, ty, "S", "REC"); ty+=sp+10;
+    CreateB(btnS, "TVE3_S", "SELL NOW", x2, ty, w, 30, UI_RED_ON); ty+=35;
+    CreateB(btnCS, "TVE3_CS", "CLOSE SELL", x2, ty, w, 20, UI_RED_DIM);
+
+    y = ty + 30;
+    ObjectCreate(0, "TVE3_L_WT", OBJ_LABEL, 0, 0, 0); 
+    ObjectSetInteger(0, "TVE3_L_WT", OBJPROP_XDISTANCE, x1+130); ObjectSetInteger(0, "TVE3_L_WT", OBJPROP_YDISTANCE, y+4); 
+    ObjectSetString(0, "TVE3_L_WT", OBJPROP_TEXT, "RECOVERY WALLET :"); 
+    ObjectSetInteger(0, "TVE3_L_WT", OBJPROP_COLOR, UI_AMBER); 
+    ebWalletDisp.Create(0, "TVE3_E_WalletVal", 0, x1+260, y, 100, 20); ebWalletDisp.Description("0.00 $"); ebWalletDisp.BackColor(UI_FIELD); ebWalletDisp.Color(UI_AMBER); ebWalletDisp.ReadOnly(true); ObjectSetInteger(0, "TVE3_E_WalletVal", OBJPROP_BORDER_COLOR, UI_AMBER);
+    CreateB(btnRW, "TVE3_RW", "RESET", x1+364, y, 46, 20, UI_AMBER); btnRW.Color(UI_BG); btnRW.FontSize(8);
+
+    y += 28;
+    CreateB(btnEMA, "TVE3_EMA", (UseEMA?"EMA Filter: ON":"EMA Filter: OFF"), x1, y, (x2-x1)+w, 25, (UseEMA?UI_BLUE:UI_GRAY)); y+=30;
+    
+    ObjectCreate(0, "TVE3_L_EP", OBJ_LABEL, 0, 0, 0); 
+    ObjectSetInteger(0, "TVE3_L_EP", OBJPROP_XDISTANCE, x1); ObjectSetInteger(0, "TVE3_L_EP", OBJPROP_YDISTANCE, y); 
+    ObjectSetString(0, "TVE3_L_EP", OBJPROP_TEXT, "Exit Rec Pips :"); 
+    ObjectSetInteger(0, "TVE3_L_EP", OBJPROP_COLOR, UI_TXT_DIM); 
+    ebExitPips.Create(0, "TVE3_E_ExitPips", 0, x1+120, y-2, 65, 18); ebExitPips.Description(IntegerToString(InpEMACrossPips)); UI_StyleEdit(ebExitPips, "TVE3_E_ExitPips"); y+=sp;
+
+    CreateRow("T1 Start", ebT1S, InpT1_Start, x1, y, "T1S", "S"); ebT1E.Create(0, "TVE3_E_T1E_End", 0, x1+185, y-2, 60, 18); ebT1E.Description(InpT1_End); UI_StyleEdit(ebT1E, "TVE3_E_T1E_End"); y+=sp;
+    CreateRow("T2 Start", ebT2S, InpT2_Start, x1, y, "T2S", "S"); ebT2E.Create(0, "TVE3_E_T2E_End", 0, x1+185, y-2, 60, 18); ebT2E.Description(InpT2_End); UI_StyleEdit(ebT2E, "TVE3_E_T2E_End"); y+=sp;
+    
+    //--- ปรับ UI ให้แสดงผล EMA ทั้ง 3 เส้น (EMA 5 | EMA 50 | EMA 200)
+    CreateRow("EMA 5", ebEMAVF, IntegerToString(InpEMAVFast), x1, y, "EVF", "V"); 
+    ebEMAF.Create(0, "TVE3_E_EMAF_F", 0, x1+185, y-2, 35, 18); ebEMAF.Description(IntegerToString(InpEMAFast)); UI_StyleEdit(ebEMAF, "TVE3_E_EMAF_F"); 
+    ebEMAS.Create(0, "TVE3_E_EMAS_S", 0, x1+225, y-2, 35, 18); ebEMAS.Description(IntegerToString(InpEMASlow)); UI_StyleEdit(ebEMAS, "TVE3_E_EMAS_S"); 
+    y+=sp+8;
+    
+    CreateB(btnCA, "TVE3_CA", "CLOSE ALL POSITIONS", x1, y, (x2-x1)+w, 30, UI_AMBER); btnCA.Color(UI_BG); ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| STEP 5: EVENT HANDLERS                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
+    if(!MQLInfoInteger(MQL_TESTER) && !LIC_Init()) return(INIT_FAILED); // account check now comes from the Google Sheet
+    if(TimeCurrent() >= StringToTime(EXPIRY_DATE)) return(INIT_FAILED);
+    trade.SetExpertMagicNumber(InpMagicNum);
+    g_RecMult = InpRecMultiplier;   // รีเซ็ตตัวคูณ Recovery เป็นค่าจากอินพุตทุกครั้งที่โหลด EA
+    DrawDashboard();
+    AI_Init();   // <<< Signal Hub AI
+    UI_Init();   // <<< animated header
+    Orb_Init();  // <<< translucent AI orb (+ position picker + chat box)
+    EventSetMillisecondTimer(90);
+    return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int r) { 
+    EventKillTimer(); Orb_Deinit(); UI_Deinit(); SR_Deinit();
+    AI_Deinit(); // <<< Signal Hub AI
+    ObjectsDeleteAll(0, "TVE3_"); 
+    if(handleVFast != INVALID_HANDLE) IndicatorRelease(handleVFast); 
+    if(handleFast != INVALID_HANDLE) IndicatorRelease(handleFast); 
+    if(handleSlow != INVALID_HANDLE) IndicatorRelease(handleSlow); 
+}
+
+void OnTimer() { UI_Frame(); Orb_Frame(); AI_OnTick(); SR_Tick(); RW_Tick(); }   // animation + AI push + web-order polling: all run even when no ticks arrive (market closed / quiet)
+
+void OnTick() {
+    if(AccountInfoDouble(ACCOUNT_EQUITY) <= (AccountInfoDouble(ACCOUNT_BALANCE) * (1.0 - (InpEquitySL_Pct/100.0)))) {
+        LogClose("EQUITY STOP", AccountInfoDouble(ACCOUNT_EQUITY) - AccountInfoDouble(ACCOUNT_BALANCE)); CloseBySide(-1); ExpertRemove(); return;
+    }
+    LIC_Tick();  // <<< Google Sheet licence re-check
+    AI_OnTick(); // <<< Signal Hub AI
+    MqlDateTime curT; TimeToStruct(TimeCurrent(), curT);
+    int nowM = (curT.hour * 60) + curT.min;
+    int t1_s = GetMinsFromDashboard(GetTxt(ebT1S, InpT1_Start));
+    int t1_e = GetMinsFromDashboard(GetTxt(ebT1E, InpT1_End));
+    int t2_s = GetMinsFromDashboard(GetTxt(ebT2S, InpT2_Start));
+    int t2_e = GetMinsFromDashboard(GetTxt(ebT2E, InpT2_End));
+    bool isT = (nowM >= t1_s && nowM <= t1_e) || (nowM >= t2_s && nowM <= t2_e);
+    
+    int trendMain = 0; int crossVF_F = 0;
+    if(!GetEMAData(trendMain, crossVF_F)) return; // ข้อมูลอินดิเคเตอร์ยังไม่พร้อม ให้รอ Tick ถัดไป
+    
+    //---ระบบ RECOVERY WALLET 
+    if(InpUseWallet) {
+        double w = GetWalletAmount(); if(w >= InpMinWalletToUse && trendMain != 0) {
+            ulong wt = 0; double wp = 0; long posType = -1;
+            
+            for(int i = PositionsTotal()-1; i >= 0; i--) {
+                if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum) {
+                    double p = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+                    
+                    bool isWrongTrend = (trendMain == 1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) || (trendMain == -1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+                    
+                    if(isWrongTrend && p < wp && (TimeCurrent() - (datetime)PositionGetInteger(POSITION_TIME)) >= InpWalletMinAgeSec) { 
+                        wp = p; wt = PositionGetTicket(i); posType = PositionGetInteger(POSITION_TYPE); 
+                    }
+                }
+            }
+            
+            if(wt > 0 && w >= MathAbs(wp)) { 
+                if(trade.PositionClose(wt)) {
+                    LogClose("WALLET (wrong trend)", wp); 
+                    SaveWalletAmount(w + wp); 
+                    if(posType == POSITION_TYPE_BUY) { LossToRecoverB += MathAbs(wp); RecCountB++; } 
+                    else if(posType == POSITION_TYPE_SELL) { LossToRecoverS += MathAbs(wp); RecCountS++; }
+                } 
+            }
+        }
+    }
+
+    double tpB = (trendMain == 1 && GetSideCount(POSITION_TYPE_BUY) > 1) ? GetSafeVal(ebTPO_B, InpTP_OldTrend) : GetSafeVal(ebTPB_D, InpTP_Normal);
+    CheckEMACrossExit(ORDER_TYPE_BUY, trendMain); 
+    ManageGrid(ORDER_TYPE_BUY, GetSafeVal(ebLotB, InpLot), GetSafeVal(ebLMultB, InpLotMult), (int)GetSafeVal(ebStepB, InpStep), (int)GetSafeVal(ebMaxB, InpMax), trendMain, crossVF_F, isT);
+    CheckExit(ORDER_TYPE_BUY, tpB);
+
+    double tpS = (trendMain == -1 && GetSideCount(POSITION_TYPE_SELL) > 1) ? GetSafeVal(ebTPO_S, InpTP_OldTrend) : GetSafeVal(ebTPS_D, InpTP_Normal);
+    CheckEMACrossExit(ORDER_TYPE_SELL, trendMain);
+    ManageGrid(ORDER_TYPE_SELL, GetSafeVal(ebLotS, InpLot), GetSafeVal(ebLMultS, InpLotMult), (int)GetSafeVal(ebStepS, InpStep), (int)GetSafeVal(ebMaxS, InpMax), trendMain, crossVF_F, isT);
+    CheckExit(ORDER_TYPE_SELL, tpS);
+
+    UpdateRecoveryGUI();
+}
+
+void OnChartEvent(const int id, const long &l, const double &d, const string &s) {
+    Orb_Event(id, s);    // <<< orb hide/show + move buttons
+    Chat_Event(id, s);   // <<< in-chat AI chat (Enter / send button)
+    if(id == CHARTEVENT_OBJECT_CLICK) {
+        if(s=="TVE3_AB") { AutoB=!AutoB; btnAB.Description(AutoB?"AutoBuy: ON":"AutoBuy: OFF"); btnAB.BackColor(AutoB?UI_GREEN_ON:UI_GREEN_DIM); }
+        if(s=="TVE3_AS") { AutoS=!AutoS; btnAS.Description(AutoS?"AutoSell: ON":"AutoSell: OFF"); btnAS.BackColor(AutoS?UI_RED_ON:UI_RED_DIM); }
+        if(s=="TVE3_EMA") { UseEMA=!UseEMA; btnEMA.Description(UseEMA?"EMA Filter: ON":"EMA Filter: OFF"); btnEMA.BackColor(UseEMA?UI_BLUE:UI_GRAY); }
+        if(s=="TVE3_AIBTN") AI_Toggle();
+        if(s=="TVE3_RW") RW_Click(); // <<< Signal Hub AI
+        if(s=="TVE3_B") LogState("BUY NOW"); if(s=="TVE3_B") trade.Buy(GetSafeVal(ebLotB, 0.01), _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), 0, 0, "");
+        if(s=="TVE3_S") LogState("SELL NOW"); if(s=="TVE3_S") trade.Sell(GetSafeVal(ebLotS, 0.01), _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), 0, 0, "");
+        if(s=="TVE3_CB") ManualClose(0); if(s=="TVE3_CS") ManualClose(1); if(s=="TVE3_CA") ManualClose(-1);
+        ChartRedraw();
+    }
+}

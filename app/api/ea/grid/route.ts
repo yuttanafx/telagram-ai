@@ -11,6 +11,9 @@ import { notifyRegime, tgEnabled } from '@/lib/telegram';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 30;
 
+// How often the candles shown on the dashboard chart are saved (minutes). Set BARS_SAVE_MIN in the Vercel environment variables; 0 = save on every EA push.
+const BARS_SAVE_MS = (Number.isFinite(Number(process.env.BARS_SAVE_MIN ?? '')) && (process.env.BARS_SAVE_MIN ?? '') !== '' ? Math.max(0, Number(process.env.BARS_SAVE_MIN)) : 2) * 60_000;
+
 const Body = z.object({
   symbol: z.string(), tf: z.string(), price: z.coerce.number(), adx: z.coerce.number(), rsi: z.coerce.number(),
   atr: z.coerce.number().positive(), ema20: z.coerce.number(), ema50: z.coerce.number(),
@@ -36,7 +39,7 @@ export async function POST(req: Request) {
   const nw = await newsFor(ind.symbol, settings);   // cheap (cached calendar) and checked on every call, so the switch happens within one EA push
     // candles are always stored (the dashboard draws the chart from them), whatever the regime source is
   const bars = p.data.bars && p.data.bars.length >= 2 ? p.data.bars : null;
-  if (bars && every(`bars:${symKey(ind.symbol)}:${ind.tf}`, 120_000)) await setJSON(`bars:${symKey(ind.symbol)}:${ind.tf}`, { ts: Date.now(), bars: bars.slice(-150) });
+  if (bars && every(`bars:${symKey(ind.symbol)}:${ind.tf}`, BARS_SAVE_MS)) await setJSON(`bars:${symKey(ind.symbol)}:${ind.tf}`, { ts: Date.now(), bars: bars.slice(-150) });
   const useExt = settings.regimeSource === 'webhook' || settings.regimeSource === 'both';
   const ext = !useExt ? null : await externalRegime(ind.symbol, acct);   // regime sent by a TradingView alert
   const writeDecision = async (r: { regime: string; confidence: number; reason: string; provider?: any; model?: string; ts: number }) => {
