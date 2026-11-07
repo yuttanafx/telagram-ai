@@ -5,8 +5,11 @@ import { riskCheck } from './risk';
 import { DEFAULT_MAP } from './strategies';
 import { DEFAULT_GRID_MAP, DEFAULT_PROFILES } from './profiles';
 
-const url = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
-const token = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
+// The Vercel / Upstash integration may add a custom prefix to the variable names (e.g. STORAGE_KV_REST_API_URL), so also accept any *KV_REST_API_URL / *KV_REST_API_TOKEN
+// (the read-only token ends with KV_REST_API_READ_ONLY_TOKEN and is deliberately not matched, because this app writes).
+const pickEnv = (re: RegExp) => { const k = Object.keys(process.env).find((n) => re.test(n) && process.env[n]); return k ? process.env[k] : undefined; };
+const url = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL ?? pickEnv(/KV_REST_API_URL$/);
+const token = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN ?? pickEnv(/KV_REST_API_TOKEN$/);
 const redis = url && token ? new Redis({ url, token }) : null;
 const mem: Record<string, any> = ((globalThis as any).__hubmem ??= {});
 
