@@ -1,13 +1,13 @@
 import { getAiConf, saveAiConf } from './aiconf';
 import { answerChat } from './chatcore';
-import { ak, getCmds, getJSON, getSettings, setJSON } from './store';
-import { dailyText, getPosSnaps, posSummary, posText } from './positions';
+import { ak, getCmds, getJSON, getSettings, saveCmds, setJSON } from './store';
+import { getLedger, getPosSnaps, periodText, posSummary, posText } from './positions';
 import { esc, RTH, saveLinks, tgEdit, tgSend, type Kb, type NotifyEvt, type TgLink } from './telegram';
 
 // The button menus of the bot: main menu, trend analysis, EA settings, notifications, status, orders.
 // Every screen is edited IN PLACE (one message that changes as you tap) instead of piling up new messages.
 type Me = TgLink;
-export const MENU_KEYS = new Set(['mn', 'st', 'od', 'dy', 'tr', 'ta', 'tm', 'ea', 'ei', 'es', 'en', 'eh', 'pa', 're', 'nt', 'nq']);
+export const MENU_KEYS = new Set(['mn', 'st', 'od', 'dy', 'dc', 'tr', 'ta', 'tm', 'ea', 'ei', 'es', 'en', 'eh', 'pa', 're', 'nt', 'nq']);
 
 const GAP_MS = 3_000;
 const PER_DAY = Number(process.env.TELEGRAM_CHAT_PER_DAY ?? 100);
@@ -48,7 +48,7 @@ export async function showMain(chatId: string, me: Me, mid?: number) {
   const online = !!seen && Date.now() - seen.ts < 5 * 60_000;
   return put(chatId, mid,
     `📶 <b>MT5 Signal Hub</b>\n<b>ระบบ:</b> ${s.paused ? '⏸ หยุดชั่วคราว' : 'ทำงานปกติ'} · AI วิเคราะห์ทุก ${conf.intervalMin} นาที\n<b>EA:</b> ${online ? '🟢 ออนไลน์' : '🔴 ไม่พบสัญญาณ'}${seen ? ' · ' + ago(seen.ts) : ''}`,
-    [[B('📈 วิเคราะห์แนวโน้ม', 'tr'), B('⚙️ ตั้งค่า EA', 'ea')], [B('📊 สถานะ', 'st'), B('🔔 การแจ้งเตือน', 'nt')], [B('🟢 BUY', 'o:BUY'), B('🔴 SELL', 'o:SELL')], [B('📋 ออเดอร์ของ EA', 'od'), B('📅 สรุปรายวัน', 'dy')]]);
+    [[B('📈 วิเคราะห์แนวโน้ม', 'tr'), B('⚙️ ตั้งค่า EA', 'ea')], [B('📊 สถานะ', 'st'), B('🔔 การแจ้งเตือน', 'nt')], [B('🟢 BUY', 'o:BUY'), B('🔴 SELL', 'o:SELL')], [B('📋 ออเดอร์ของ EA', 'od'), B('📅 สรุปยอด', 'dy')]]);
 }
 
 /* ---------- status / orders ---------- */
@@ -62,14 +62,40 @@ export async function showStatus(chatId: string, me: Me, mid?: number) {
 }
 export async function showOrders(chatId: string, me: Me, mid?: number) {
   const [cmdsAll, snaps] = await Promise.all([getCmds(me.acct), getPosSnaps(me.acct)]);
-  const cmds = cmdsAll.slice(0, 5);
-  return put(chatId, mid, posText(snaps) + `\n\n📋 <b>คำสั่งจากเว็บ/AI ล่าสุด</b>\n` + (cmds.length
-    ? cmds.map((c) => `${ICON[c.status] ?? ''} ${clock(c.ts)} <b>${c.side}</b> ${esc(c.symbol)} ${c.lot}${c.ticket ? ' #' + c.ticket : ''}${c.note ? ' – ' + esc(c.note.slice(0, 60)) : ''}`).join('\n') : 'ยังไม่มีคำสั่ง') + `\n<i>อัปเดต ${hms()}</i>`,
-    [[B('📅 สรุปรายวัน', 'dy')], [B('🔄 รีเฟรช', 'od'), B('‹ กลับ', 'mn')]]);
+  const dsMs = Math.max(0, ...snaps.map((s) => s.ds ?? 0)) * 1000;
+  const cmds = cmdsAll.filter((c) => !dsMs || c.ts >= dsMs || c.status === 'pending' || c.status === 'sent').slice(0, 5);   // only today's (older ones are cleared daily)
+  return put(chatId, mid, posText(snaps) + `\n\n📋 <b>คำสั่งจากเว็บ/AI วันนี้</b>\n` + (cmds.length
+    ? cmds.map((c) => `${ICON[c.status] ?? ''} ${clock(c.ts)} <b>${c.side}</b> ${esc(c.symbol)} ${c.lot}${c.ticket ? ' #' + c.ticket : ''}${c.note ? ' – ' + esc(c.note.slice(0, 60)) : ''}`).join('\n') : 'ยังไม่มีคำสั่งวันนี้') + `\n<i>อัปเดต ${hms()}</i>`,
+    [[B('📅 สรุปยอด', 'dy')], [B('🔄 รีเฟรช', 'od'), B('‹ กลับ', 'mn')]]);
 }
-export async function showDaily(chatId: string, me: Me, mid?: number) {
+export async function showDaily(chatId: string, me: Me, mid?: number, mode?: string) {
+  const m = mode === 'w' || mode === 'm' ? mode : 'd';
+  const [{ led }, snaps] = await Promise.all([getLedger(me.acct), getPosSnaps(me.acct)]);
+  const tab = (k: string, label: string) => B((m === k ? '• ' : '') + label, `dy:${k}`);
+  return put(chatId, mid, periodText(led, m, snaps) + `\n<i>อัปเดต ${hms()}</i>`,
+    [[tab('d', 'รายวัน'), tab('w', 'รายสัปดาห์'), tab('m', 'รายเดือน')], [B('📋 ออเดอร์ของ EA', 'od'), B('🗑 ล้างประวัติ', 'dc')], [B('🔄 รีเฟรช', `dy:${m}`), B('‹ กลับ', 'mn')]]);
+}
+
+// Clear history: finished web/AI commands older than today (the bot also does this by itself once a day), or the whole statistics (start counting again from today).
+const BKK = 7 * 3_600_000;
+export async function clearHistory(chatId: string, me: Me, mid: number, x?: string) {
   const snaps = await getPosSnaps(me.acct);
-  return put(chatId, mid, dailyText(snaps) + `\n<i>อัปเดต ${hms()}</i>`, [[B('📋 ออเดอร์ของ EA', 'od')], [B('🔄 รีเฟรช', 'dy'), B('‹ กลับ', 'mn')]]);
+  const b = new Date(Date.now() + BKK);
+  const todayStartMs = Math.max(0, ...snaps.map((s) => s.ds ?? 0)) * 1000 || Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) - BKK;
+  const todayKey = Math.max(0, ...snaps.map((s) => s.tk ?? 0)) || b.getUTCFullYear() * 10000 + (b.getUTCMonth() + 1) * 100 + b.getUTCDate();
+  if (x === 'c') {
+    const all = await getCmds(me.acct);
+    const keep = all.filter((c) => c.ts >= todayStartMs || c.status === 'pending' || c.status === 'sent');
+    await saveCmds(keep, me.acct);
+    return put(chatId, mid, `🧹 ล้างรายการคำสั่งเก่าแล้ว <b>${all.length - keep.length}</b> รายการ\nยอดรายวัน/สัปดาห์/เดือนยังอยู่ครบ`, [[B('‹ กลับ', 'dy:d')]]);
+  }
+  if (x === 'z') return put(chatId, mid, '⚠️ <b>ล้างสถิติทั้งหมด?</b>\nยอดรายวัน รายสัปดาห์ และรายเดือนที่เก็บไว้จะถูกลบ แล้วเริ่มนับใหม่ตั้งแต่วันนี้\nกู้คืนไม่ได้', [[B('✅ ยืนยัน ล้างทั้งหมด', 'dc:zy'), B('❌ ยกเลิก', 'dc')]]);
+  if (x === 'zy') {
+    await setJSON(ak('ledgerSince', me.acct), todayKey);
+    return put(chatId, mid, '♻️ ล้างสถิติแล้ว เริ่มนับใหม่ตั้งแต่วันนี้', [[B('‹ กลับ', 'dy:d')]]);
+  }
+  return put(chatId, mid, '🗑 <b>ล้างประวัติ</b>\n• <b>รายการคำสั่งเก่า</b> ลบคำสั่งจากเว็บ/AI ที่เก่ากว่าวันนี้ (บอทล้างให้เองทุกวันอยู่แล้ว)\n• <b>สถิติทั้งหมด</b> ลบยอดรายวัน/สัปดาห์/เดือนที่เก็บไว้ แล้วเริ่มนับใหม่ตั้งแต่วันนี้\n\nยอดรายสัปดาห์และรายเดือนจะคงอยู่ จนกว่าจะกดล้างสถิติ',
+    [[B('🧹 ล้างรายการคำสั่งเก่า', 'dc:c')], [B('♻️ ล้างสถิติทั้งหมด', 'dc:z')], [B('‹ กลับ', 'dy:d')]]);
 }
 
 /* ---------- trend analysis ---------- */
@@ -133,7 +159,8 @@ export async function onMenuButton(chatId: string, me: Me, mid: number, [k, x]: 
     case 'mn': return showMain(chatId, me, mid);
     case 'st': return showStatus(chatId, me, mid);
     case 'od': return showOrders(chatId, me, mid);
-    case 'dy': return showDaily(chatId, me, mid);
+    case 'dy': return showDaily(chatId, me, mid, x);
+    case 'dc': return clearHistory(chatId, me, mid, x);
     case 'tr': return showTrend(chatId, me, mid);
     case 'ta': case 'tm': return runAI(chatId, me, mid, k);
     case 'ea': return showEA(chatId, me, mid);
