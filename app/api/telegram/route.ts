@@ -4,7 +4,7 @@ import { answerChat } from '@/lib/chatcore';
 import { addCmd, ak, getJSON, getUsers, setJSON } from '@/lib/store';
 import { esc, saveLinks, tgApi, tgSend, type Kb, type TgLink } from '@/lib/telegram';
 import { CFG_KEYS, cfgButton, cfgHome, cfgValue } from '@/lib/tgconfig';
-import { MENU_KEYS, gate, onMenuButton, plain, setPaused, showMain, showOrders, showStatus } from '@/lib/tgmenu';
+import { MENU_KEYS, gate, onMenuButton, plain, setPaused, showDaily, showMain, showOrders, showStatus } from '@/lib/tgmenu';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 30;
 
@@ -19,7 +19,8 @@ const LOTS = (process.env.TELEGRAM_LOTS || '0.01,0.02,0.05,0.1').split(',').map(
 const HELP = `พิมพ์ /menu เพื่อเปิดเมนูปุ่มกด (วิเคราะห์แนวโน้ม, ตั้งค่า EA, สถานะ, การแจ้งเตือน) หรือใช้คำสั่ง
 /login <รหัสผ่าน> ผูกแชทนี้กับบัญชีของคุณ (รหัสเดียวกับที่ใช้เข้าเว็บ)
 /status สถานะระบบและการตัดสินใจล่าสุดของ AI
-/orders คำสั่งล่าสุด 10 รายการ
+/orders ออเดอร์ของ EA (ไม้ที่เปิดอยู่ + ปิดล่าสุด)
+/daily สรุปยอดรายวัน
 /buy [คู่เงิน] <lot> [sl] [tp] สั่งซื้อ เช่น /buy XAUUSD 0.01 หรือ /buy 0.01 (ใช้คู่ล่าสุดของ AI)
 /sell [คู่เงิน] <lot> [sl] [tp] สั่งขาย
 /confirm ยืนยันออเดอร์ที่รออยู่ (หมดอายุใน 2 นาที) /cancel ยกเลิก
@@ -153,6 +154,7 @@ async function onText(chatId: string, messageId: number, text: string) {
   }
   if (cmd === 'status') return showStatus(chatId, me);
   if (cmd === 'orders') return showOrders(chatId, me);
+  if (cmd === 'daily') return showDaily(chatId, me);
   if (cmd === 'pause' || cmd === 'resume') return tgSend(chatId, await setPaused(me, cmd === 'pause'));
   if (cmd === 'confirm' || cmd === 'cancel') return resolvePending(chatId, acct, cmd === 'confirm');
 

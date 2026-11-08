@@ -1,12 +1,13 @@
 import { getAiConf, saveAiConf } from './aiconf';
 import { answerChat } from './chatcore';
 import { ak, getCmds, getJSON, getSettings, setJSON } from './store';
+import { dailyText, getPosSnaps, posSummary, posText } from './positions';
 import { esc, RTH, saveLinks, tgEdit, tgSend, type Kb, type NotifyEvt, type TgLink } from './telegram';
 
 // The button menus of the bot: main menu, trend analysis, EA settings, notifications, status, orders.
 // Every screen is edited IN PLACE (one message that changes as you tap) instead of piling up new messages.
 type Me = TgLink;
-export const MENU_KEYS = new Set(['mn', 'st', 'od', 'tr', 'ta', 'tm', 'ea', 'ei', 'es', 'en', 'eh', 'pa', 're', 'nt', 'nq']);
+export const MENU_KEYS = new Set(['mn', 'st', 'od', 'dy', 'tr', 'ta', 'tm', 'ea', 'ei', 'es', 'en', 'eh', 'pa', 're', 'nt', 'nq']);
 
 const GAP_MS = 3_000;
 const PER_DAY = Number(process.env.TELEGRAM_CHAT_PER_DAY ?? 100);
@@ -47,23 +48,28 @@ export async function showMain(chatId: string, me: Me, mid?: number) {
   const online = !!seen && Date.now() - seen.ts < 5 * 60_000;
   return put(chatId, mid,
     `📶 <b>MT5 Signal Hub</b>\n<b>ระบบ:</b> ${s.paused ? '⏸ หยุดชั่วคราว' : 'ทำงานปกติ'} · AI วิเคราะห์ทุก ${conf.intervalMin} นาที\n<b>EA:</b> ${online ? '🟢 ออนไลน์' : '🔴 ไม่พบสัญญาณ'}${seen ? ' · ' + ago(seen.ts) : ''}`,
-    [[B('📈 วิเคราะห์แนวโน้ม', 'tr'), B('⚙️ ตั้งค่า EA', 'ea')], [B('📊 สถานะ', 'st'), B('🔔 การแจ้งเตือน', 'nt')], [B('🟢 BUY', 'o:BUY'), B('🔴 SELL', 'o:SELL')], [B('📋 ออเดอร์ล่าสุด', 'od')]]);
+    [[B('📈 วิเคราะห์แนวโน้ม', 'tr'), B('⚙️ ตั้งค่า EA', 'ea')], [B('📊 สถานะ', 'st'), B('🔔 การแจ้งเตือน', 'nt')], [B('🟢 BUY', 'o:BUY'), B('🔴 SELL', 'o:SELL')], [B('📋 ออเดอร์ของ EA', 'od'), B('📅 สรุปรายวัน', 'dy')]]);
 }
 
 /* ---------- status / orders ---------- */
 export async function showStatus(chatId: string, me: Me, mid?: number) {
-  const [s, cmds, dec] = await Promise.all([getSettings(), getCmds(me.acct), getJSON<any>(ak('decision', me.acct), null)]);
+  const [s, cmds, dec, snaps] = await Promise.all([getSettings(), getCmds(me.acct), getJSON<any>(ak('decision', me.acct), null), getPosSnaps(me.acct)]);
   const open = cmds.filter((c) => c.status === 'pending' || c.status === 'sent').length;
-  return put(chatId, mid, `📊 <b>สถานะระบบ</b>\n${s.paused ? '⏸ หยุดชั่วคราว' : '▶️ ทำงานปกติ'}\nคิวค้าง <b>${open}</b> คำสั่ง\n` + (dec
+  return put(chatId, mid, `📊 <b>สถานะระบบ</b>\n${s.paused ? '⏸ หยุดชั่วคราว' : '▶️ ทำงานปกติ'}\nคิวค้าง <b>${open}</b> คำสั่ง\n${posSummary(snaps)}` + (dec
     ? `\n🤖 <b>AI ล่าสุด</b> (${clock(dec.ts)})\n${esc(dec.symbol)} · ${esc(dec.regime)} · ${esc(dec.strategy)} · มั่นใจ <b>${Math.round((dec.confidence ?? 0) * 100)}%</b>` + (dec.reason ? `\n<blockquote>${esc(dec.reason)}</blockquote>` : '')
     : '\nAI ล่าสุด: ยังไม่มี') + `\n<i>อัปเดต ${hms()}</i>`,
-    [[B('🔄 รีเฟรช', 'st'), B('‹ กลับ', 'mn')]]);
+    [[B('📋 ออเดอร์ของ EA', 'od')], [B('🔄 รีเฟรช', 'st'), B('‹ กลับ', 'mn')]]);
 }
 export async function showOrders(chatId: string, me: Me, mid?: number) {
-  const cmds = (await getCmds(me.acct)).slice(0, 10);
-  return put(chatId, mid, `📋 <b>ออเดอร์ล่าสุด</b>\n` + (cmds.length
+  const [cmdsAll, snaps] = await Promise.all([getCmds(me.acct), getPosSnaps(me.acct)]);
+  const cmds = cmdsAll.slice(0, 5);
+  return put(chatId, mid, posText(snaps) + `\n\n📋 <b>คำสั่งจากเว็บ/AI ล่าสุด</b>\n` + (cmds.length
     ? cmds.map((c) => `${ICON[c.status] ?? ''} ${clock(c.ts)} <b>${c.side}</b> ${esc(c.symbol)} ${c.lot}${c.ticket ? ' #' + c.ticket : ''}${c.note ? ' – ' + esc(c.note.slice(0, 60)) : ''}`).join('\n') : 'ยังไม่มีคำสั่ง') + `\n<i>อัปเดต ${hms()}</i>`,
-    [[B('🔄 รีเฟรช', 'od'), B('‹ กลับ', 'mn')]]);
+    [[B('📅 สรุปรายวัน', 'dy')], [B('🔄 รีเฟรช', 'od'), B('‹ กลับ', 'mn')]]);
+}
+export async function showDaily(chatId: string, me: Me, mid?: number) {
+  const snaps = await getPosSnaps(me.acct);
+  return put(chatId, mid, dailyText(snaps) + `\n<i>อัปเดต ${hms()}</i>`, [[B('📋 ออเดอร์ของ EA', 'od')], [B('🔄 รีเฟรช', 'dy'), B('‹ กลับ', 'mn')]]);
 }
 
 /* ---------- trend analysis ---------- */
@@ -127,6 +133,7 @@ export async function onMenuButton(chatId: string, me: Me, mid: number, [k, x]: 
     case 'mn': return showMain(chatId, me, mid);
     case 'st': return showStatus(chatId, me, mid);
     case 'od': return showOrders(chatId, me, mid);
+    case 'dy': return showDaily(chatId, me, mid);
     case 'tr': return showTrend(chatId, me, mid);
     case 'ta': case 'tm': return runAI(chatId, me, mid, k);
     case 'ea': return showEA(chatId, me, mid);

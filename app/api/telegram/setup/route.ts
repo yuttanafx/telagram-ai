@@ -17,7 +17,7 @@ export async function POST(req: Request) {
     const url = `${new URL(req.url).origin}/api/telegram`;
     const r = await tgApi('setWebhook', { url, secret_token: secret, allowed_updates: ['message', 'callback_query'], drop_pending_updates: true });
     await tgApi('setMyCommands', { commands: [
-      { command: 'menu', description: 'เมนูปุ่มกด' }, { command: 'settings', description: 'ตั้งค่ากริดและ AI' }, { command: 'status', description: 'สถานะระบบและ AI ล่าสุด' }, { command: 'orders', description: 'คำสั่งล่าสุด' },
+      { command: 'menu', description: 'เมนูปุ่มกด' }, { command: 'settings', description: 'ตั้งค่ากริดและ AI' }, { command: 'status', description: 'สถานะระบบและ AI ล่าสุด' }, { command: 'orders', description: 'ออเดอร์ของ EA' }, { command: 'daily', description: 'สรุปยอดรายวัน' },
       { command: 'pause', description: 'หยุดระบบ (ผู้ดูแล)' }, { command: 'resume', description: 'เปิดระบบ (ผู้ดูแล)' },
       { command: 'login', description: 'ผูกแชทกับบัญชี' }, { command: 'logout', description: 'เลิกผูกแชท' }, { command: 'help', description: 'วิธีใช้' } ] });
     return Response.json({ ...r, url });
