@@ -1,6 +1,7 @@
 import './globals.css';
 import { IBM_Plex_Sans_Thai } from 'next/font/google';
 import Galaxy from '@/components/Galaxy';
+import { Analytics } from '@vercel/analytics/next';
 
 const font = IBM_Plex_Sans_Thai({ subsets: ['thai', 'latin'], weight: ['400', '500', '600', '700'], display: 'swap' });
 export const metadata = { title: 'MT5 Signal Hub' };
@@ -12,6 +13,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={font.className}>
         <Galaxy />
         {children}
+        <Analytics />
       </body>
     </html>
   );
